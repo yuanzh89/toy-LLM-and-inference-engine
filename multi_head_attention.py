@@ -46,7 +46,9 @@ class MultiHeadAttention(nn.Module):
 
         # (batch_size, num_heads, seq_len, seq_len)
         attn_scores = torch.matmul(Q, K.transpose(-1, -2))
-        attn_scores = attn_scores / torch.sqrt(self.d_k)
+        attn_scores = attn_scores / math.sqrt(self.d_k)
+        # attn_scores = attn_scores / torch.sqrt(
+        #     torch.tensor(self.d_k, device=attn_scores.device, dtype=attn_scores.dtype))
 
         if mask is not None:
             attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
@@ -63,6 +65,9 @@ class MultiHeadAttention(nn.Module):
 
         # (batch_size, seq_len, d_model)
         output = self.o_proj(attn_output)
+
+        if self.dropout is not None:
+            output = self.dropout(output)  # ← REQUIRED in Transformer block
 
         output = input + output
 
