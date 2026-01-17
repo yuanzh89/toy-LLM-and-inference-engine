@@ -8,8 +8,8 @@ class FeedForwardNetwork(nn.Module):
         self.block = nn.Sequential(
             nn.Linear(d_model, d_ff),
             nn.GELU(),
-            nn.Dropout(dropout),
             nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
         )
 
         self.layer_norm = nn.LayerNorm(d_model)
