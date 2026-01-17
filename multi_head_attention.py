@@ -29,7 +29,8 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=True, device=device)
         self.o_proj = nn.Linear(d_model, d_model, bias=True, device=device)
 
-        self.dropout = None if math.isclose(dropout, 0.0) else nn.Dropout(dropout)
+        self.attn_dropout = None if math.isclose(dropout, 0.0) else nn.Dropout(dropout)
+        self.output_dropout = None if math.isclose(dropout, 0.0) else nn.Dropout(dropout)
 
         self.layer_norm = nn.LayerNorm(d_model, device=device)
 
@@ -55,8 +56,8 @@ class MultiHeadAttention(nn.Module):
 
         attn_weights = F.softmax(attn_scores, dim=-1)
 
-        if self.dropout is not None:
-            attn_weights = self.dropout(attn_weights)
+        if self.attn_dropout is not None:
+            attn_weights = self.attn_dropout(attn_weights)
 
         # (batch_size, num_heads, seq_len, d_k)
         attn_output = torch.matmul(attn_weights, V)
@@ -66,8 +67,8 @@ class MultiHeadAttention(nn.Module):
         # (batch_size, seq_len, d_model)
         output = self.o_proj(attn_output)
 
-        if self.dropout is not None:
-            output = self.dropout(output)  # ← REQUIRED in Transformer block
+        if self.output_dropout is not None:
+            output = self.output_dropout(output)
 
         output = input + output
 
