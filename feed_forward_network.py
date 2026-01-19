@@ -5,16 +5,18 @@ class FeedForwardNetwork(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
 
-        self.block = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
-
         self.layer_norm = nn.LayerNorm(d_model)
+        self.up_proj = nn.Linear(d_model, d_ff)
+        self.gelu = nn.GELU()
+        self.down_proj = nn.Linear(d_ff, d_model)
+        self.dropout = None if dropout == 0.0 else nn.Dropout(dropout)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        output = self.layer_norm(input)
-        output = self.block(output)
-        return input + output
+        residual = input
+        x = self.layer_norm(input)
+        x = self.up_proj(x)
+        x = self.gelu(x)
+        x = self.down_proj(x)
+        x = self.dropout(x)
+        return x + residual
+
