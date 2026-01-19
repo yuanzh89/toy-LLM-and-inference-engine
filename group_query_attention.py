@@ -81,6 +81,8 @@ class GroupQueryAttention(nn.Module):
 
         self.head_dim = self.d_model // self.num_query_heads
 
+        self.layer_norm = nn.LayerNorm(d_model)
+
         self.q_proj = nn.Linear(d_model, self.num_query_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d_model, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d_model, self.num_kv_heads * self.head_dim, bias=False)
@@ -91,6 +93,9 @@ class GroupQueryAttention(nn.Module):
 
     def forward(self, input: torch.Tensor, apply_casual_mask: bool) -> torch.Tensor:
         batch_size, seq_len, d_model = input.size()
+
+        # [batch_size, seq_len, d_model]
+        input = self.layer_norm(input)
 
         q = self.q_proj(input)  # [batch_size, seq_len, num_query_heads * head_dim]
         k = self.k_proj(input)  # [batch_size, seq_len, num_kv_heads * head_dim]
