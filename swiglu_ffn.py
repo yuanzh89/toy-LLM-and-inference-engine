@@ -13,7 +13,7 @@ class SwiGLUFFNLayer(nn.Module):
         self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
         self.w2 = nn.Linear(d_model, hidden_dim, bias=False)
         self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
-        self.dropout = None if math.isclose(dropout, 0.0) else nn.Dropout(p=dropout)
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -24,8 +24,7 @@ class SwiGLUFFNLayer(nn.Module):
         x2 = self.w2(x)
         output = self.w3(x1 * F.silu(x2))
 
-        if self.dropout is not None:
-            output = self.dropout(output)
+        output = self.dropout(output)
 
         return output + residual
 
@@ -37,8 +36,7 @@ class FusedSwiGLUFFNLayer(nn.Module):
 
         self.w12 = nn.Linear(d_model, hidden_dim * 2, bias=False)
         self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
-
-        self.dropout = None if math.isclose(dropout, 0.0) else nn.Dropout(p=dropout)
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -49,7 +47,6 @@ class FusedSwiGLUFFNLayer(nn.Module):
         x1, x2 = x12.chunk(2, dim=-1)
         output = self.w3(x1 * F.silu(x2))
 
-        if self.dropout is not None:
-            output = self.dropout(output)
+        output = self.dropout(output)
 
         return output + residual
