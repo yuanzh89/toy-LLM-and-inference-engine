@@ -32,13 +32,13 @@ class MultiHeadAttention(nn.Module):
         self.attn_dropout = None if math.isclose(dropout, 0.0) else nn.Dropout(dropout)
         self.output_dropout = None if math.isclose(dropout, 0.0) else nn.Dropout(dropout)
 
-        self.layer_norm = nn.LayerNorm(d_model, device=device)
+        self.rms_norm = nn.RMSNorm(d_model, device=device)
 
     def forward(self, input: torch.Tensor, mask: torch.Tensor = None) -> tuple[Tensor | Any, Tensor | Any]:
         batch_size, seq_len, d_model = input.size()
 
         # Pre-norm
-        normed_input = self.layer_norm(input)
+        normed_input = self.rms_norm(input)
 
         # (batch_size, seq_len, d_model) -> (batch_size, num_heads, seq_len, d_k)
         Q = self.q_proj(normed_input).reshape(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)

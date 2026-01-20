@@ -6,7 +6,8 @@ from feed_forward_network import FeedForwardNetwork
 
 
 class Transformer(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1, device: torch.device = torch.device('cpu')):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1,
+                 device: torch.device = torch.device('cuda')):
         super().__init__()
 
         self.device = device
