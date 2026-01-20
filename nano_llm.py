@@ -3,21 +3,26 @@ from transformer import Transformer
 import torch
 import torch.nn as nn
 
+
 class NanoLLM(nn.Module):
-    def __init__(self, vocab_size: int, max_seq_len: int, d_model: int, num_heads: int, d_ff: int, num_layers: int, dropout: float = 0.1, device: torch.device = torch.device('cpu')):
+    def __init__(self, vocab_size: int, max_seq_len: int, d_model: int, num_heads: int, d_ff: int, num_layers: int,
+                 dropout: float = 0.1, device: torch.device = torch.device('cpu')):
         super().__init__()
 
         self.embedding = nn.Embedding(vocab_size, d_model, device=device)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False, device=device)
+        # Weight Typing (weight sharing) between embedding layer and LM head layer
+        # By sharing their parameters/weights in memory
+        self.lm_head.weight = self.embedding.weight
 
+        # TODO: How to generate and apply RoPE matrix?
         self.pos_embedding = nn.Embedding(max_seq_len, d_model, device=device)
 
         self.transformer_layers = nn.ModuleList([
             Transformer(d_model, num_heads, d_ff, dropout=dropout, device=device) for _ in range(num_layers)
         ])
 
-        self.layer_norm = nn.LayerNorm(d_model, device=device)
-
-        self.lm_head = nn.Linear(d_model, vocab_size, device=device)
+        self.rms_norm = nn.RMSNorm(d_model, device=device)
 
         self.device = device
 
@@ -44,11 +49,9 @@ class NanoLLM(nn.Module):
         for transformer_layer in self.transformer_layers:
             output = transformer_layer(output, mask=mask)
 
-        output = self.layer_norm(output)
+        output = self.rms_norm(output)
 
         # (batch_size, seq_len, vocab_size)
         output = self.lm_head(output)
 
         return output
-
-
