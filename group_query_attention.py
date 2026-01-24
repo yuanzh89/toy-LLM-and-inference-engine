@@ -91,15 +91,15 @@ class GroupQueryAttention(nn.Module):
         self.attn_dropout = None if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
         self.o_dropout = None if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
 
-    def forward(self, input: torch.Tensor, apply_casual_mask: bool) -> torch.Tensor:
-        batch_size, seq_len, d_model = input.size()
+    def forward(self, x: torch.Tensor, apply_casual_mask: bool) -> torch.Tensor:
+        batch_size, seq_len, d_model = x.size()
 
         # [batch_size, seq_len, d_model]
-        input = self.rms_norm(input)
+        x = self.rms_norm(x)
 
-        q = self.q_proj(input)  # [batch_size, seq_len, num_query_heads * head_dim]
-        k = self.k_proj(input)  # [batch_size, seq_len, num_kv_heads * head_dim]
-        v = self.v_proj(input)  # [batch_size, seq_len, num_kv_heads * head_dim]
+        q = self.q_proj(x)  # [batch_size, seq_len, num_query_heads * head_dim]
+        k = self.k_proj(x)  # [batch_size, seq_len, num_kv_heads * head_dim]
+        v = self.v_proj(x)  # [batch_size, seq_len, num_kv_heads * head_dim]
 
         # [batch_size, num_query_heads, seq_len, head_dim]
         q = q.view(batch_size, seq_len, self.num_query_heads, self.head_dim).transpose(1, 2)
@@ -118,7 +118,7 @@ class GroupQueryAttention(nn.Module):
 
         if apply_casual_mask:
             # [seq_len, seq_len]
-            casual_mask = torch.tril(torch.ones((seq_len, seq_len), device=input.device))
+            casual_mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device))
             # [1, 1, seq_len, seq_len]
             casual_mask = casual_mask.unsqueeze(0).unsqueeze(0)
             attn_scores = attn_scores.masked_fill(casual_mask == 0, float('-inf'))
@@ -144,4 +144,4 @@ class GroupQueryAttention(nn.Module):
             output = self.o_dropout(output)
 
         # [batch_size, seq_len, d_model]
-        return input + output
+        return x + output

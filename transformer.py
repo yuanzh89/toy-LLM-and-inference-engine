@@ -1,21 +1,18 @@
 import torch
 import torch.nn as nn
 
-from multi_head_attention import MultiHeadAttention
-from feed_forward_network import FeedForwardNetwork
+from group_query_attention import *
+from swiglu_ffn import *
 
 
 class Transformer(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1,
-                 device: torch.device = torch.device('cuda')):
+    def __init__(self, d_model: int, d_ff: int, num_query_heads: int, num_kv_heads: int, dropout: float = 0.1):
         super().__init__()
 
-        self.device = device
+        self.mha = GroupQueryAttention(d_model, num_query_heads, num_kv_heads, dropout=dropout)
+        self.ffn = FusedSwiGLUFFNLayer(d_model, d_ff, dropout=dropout)
 
-        self.mha = MultiHeadAttention(d_model, num_heads, dropout=dropout)
-        self.ffn = FeedForwardNetwork(d_model, d_ff, dropout=dropout)
-
-    def forward(self, input: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        output = self.mha(input, mask, device=self.device)
-        output = self.ffn(output, device=self.device)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        output = self.mha(x, mask)
+        output = self.ffn(output)
         return output

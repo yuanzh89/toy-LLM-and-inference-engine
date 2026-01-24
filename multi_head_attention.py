@@ -34,11 +34,11 @@ class MultiHeadAttention(nn.Module):
 
         self.rms_norm = nn.RMSNorm(d_model, device=device)
 
-    def forward(self, input: torch.Tensor, mask: torch.Tensor = None) -> tuple[Tensor | Any, Tensor | Any]:
-        batch_size, seq_len, d_model = input.size()
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> tuple[Tensor | Any, Tensor | Any]:
+        batch_size, seq_len, d_model = x.size()
 
         # Pre-norm
-        normed_input = self.rms_norm(input)
+        normed_input = self.rms_norm(x)
 
         # (batch_size, seq_len, d_model) -> (batch_size, num_heads, seq_len, d_k)
         Q = self.q_proj(normed_input).reshape(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
@@ -70,6 +70,6 @@ class MultiHeadAttention(nn.Module):
         if self.output_dropout is not None:
             output = self.output_dropout(output)
 
-        output = input + output
+        output = x + output
 
         return output, attn_weights

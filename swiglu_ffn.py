@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class SwiGLUFFNLayer(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -27,6 +28,7 @@ class SwiGLUFFNLayer(nn.Module):
         output = self.dropout(output)
 
         return output + residual
+
 
 class FusedSwiGLUFFNLayer(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.1):
