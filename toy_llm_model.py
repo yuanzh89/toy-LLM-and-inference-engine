@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class NanoLLM(nn.Module):
+class ToyLLMModel(nn.Module):
     def __init__(self, vocab_size: int, max_seq_len: int, d_model: int, num_heads: int, d_ff: int, num_layers: int,
                  dropout: float = 0.1):
         super().__init__()
