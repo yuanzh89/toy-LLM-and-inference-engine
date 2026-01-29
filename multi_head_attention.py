@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from rope import apply_rope
+
 
 class MultiHeadAttention(nn.Module):
     """
@@ -44,6 +46,9 @@ class MultiHeadAttention(nn.Module):
         Q = self.q_proj(normed_input).reshape(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
         K = self.k_proj(normed_input).reshape(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
         V = self.v_proj(normed_input).reshape(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+
+        # Apply RoPE to Q and K projections before attention calculation
+        Q, K = apply_rope(Q, K)
 
         # (batch_size, num_heads, seq_len, seq_len)
         attn_scores = torch.matmul(Q, K.transpose(-1, -2))

@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from rope import apply_rope
+
 
 class GroupQueryAttention(nn.Module):
     """
@@ -107,6 +109,9 @@ class GroupQueryAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         # [batch_size, num_kv_heads, seq_len, head_dim]
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE to Q and K projections before attention calculation
+        q, k = apply_rope(q, k)
 
         # Expand KV heads to match Q heads
         # [batch_size, num_query_heads, seq_len, head_dim]
