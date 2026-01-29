@@ -48,8 +48,8 @@ class ToyLLM:
 
         next_token_id = self.model.forward(token_ids)
 
-        # 1. Convert the single value tensor into a standard Python number
-        # 2. Transfer from GPU to CPU
+        # 1. Copy the value from GPU to CPU
+        # 2. Converts the tensor to a native Python scalar
         next_token_id = next_token_id.item()
         next_token: str = self.tokenizer.decode(next_token_id)
 
