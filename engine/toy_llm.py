@@ -1,4 +1,4 @@
-from model.toy_llm_model import ToyLLMModel
+from layer.toy_llm_model import ToyLLMModel
 from transformers import AutoTokenizer, AutoConfig
 
 import torch
@@ -30,7 +30,7 @@ class ToyLLM:
             Performs a single forward pass to generate the next token from a text prompt.
 
             This method handles the tokenization of the input string, transfers the
-            tensors to the configured device (GPU/CPU), executes the model forward
+            tensors to the configured device (GPU/CPU), executes the layer forward
             pass, and decodes the resulting token ID back into a human-readable string.
 
             Args:

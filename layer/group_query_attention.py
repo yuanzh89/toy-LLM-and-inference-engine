@@ -13,7 +13,7 @@ class GroupQueryAttention(nn.Module):
 
     This implements the attention variant used in modern LLMs (e.g., LLaMA, PaLM),
     where multiple query heads share a smaller set of key/value heads to reduce
-    memory and computation while preserving model quality.
+    memory and computation while preserving layer quality.
 
     Instead of having one K/V head per Q head (as in standard multi-head attention),
     GQA groups query heads so that:
@@ -43,7 +43,7 @@ class GroupQueryAttention(nn.Module):
 
     Args:
         d_model (int):
-            Embedding dimension of the model.
+            Embedding dimension of the layer.
 
         num_query_heads (int):
             Number of query heads.
