@@ -85,16 +85,19 @@ class GroupQueryAttention(nn.Module):
 
         self.rms_norm = nn.RMSNorm(d_model)
 
+        # We can fuse q_proj, k_proj, v_proj -> qkv_proj matrix for performance optimization.
         self.q_proj = nn.Linear(d_model, self.num_query_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d_model, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d_model, self.num_kv_heads * self.head_dim, bias=False)
 
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
-        self.attn_dropout = None if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
-        self.o_dropout = None if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
+        self.attn_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
+        self.o_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
 
-    def forward(self, x: torch.Tensor, apply_casual_mask: bool) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, apply_casual_mask: bool = True) -> torch.Tensor:
         batch_size, seq_len, d_model = x.size()
+
+        residual = x
 
         # [batch_size, seq_len, d_model]
         x = self.rms_norm(x)
@@ -131,9 +134,7 @@ class GroupQueryAttention(nn.Module):
         # Safe softmax
         attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values
         attn_scores = F.softmax(attn_scores, dim=-1)
-
-        if self.attn_dropout is not None:
-            attn_scores = self.attn_dropout(attn_scores)
+        attn_scores = self.attn_dropout(attn_scores)
 
         # [batch_size, num_query_heads, seq_len, head_dim]
         attn_output = torch.matmul(attn_scores, v)
@@ -144,9 +145,7 @@ class GroupQueryAttention(nn.Module):
 
         # [batch_size, seq_len, d_model]
         output = self.o_proj(attn_output)
-
-        if self.o_dropout is not None:
-            output = self.o_dropout(output)
+        output = self.o_dropout(output)
 
         # [batch_size, seq_len, d_model]
-        return x + output
+        return residual + output
