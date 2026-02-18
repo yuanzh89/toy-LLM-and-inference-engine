@@ -1,12 +1,13 @@
-from transformer import Transformer
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from transformer import TransformerBlock
+
 
 class ToyLLMModel(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int, num_query_heads: int, num_kv_heads: int, d_ff: int, num_layers: int,
+    def __init__(self, vocab_size: int, d_model: int, num_query_heads: int, num_kv_heads: int, d_ff: int,
+                 num_layers: int,
                  dropout: float = 0.1):
         super().__init__()
 
@@ -17,22 +18,20 @@ class ToyLLMModel(nn.Module):
         self.lm_head.weight = self.embedding.weight
 
         self.transformer_layers = nn.ModuleList([
-            Transformer(d_model, d_ff, num_query_heads, num_kv_heads, dropout=dropout) for _ in range(num_layers)
+            TransformerBlock(d_model, d_ff, num_query_heads, num_kv_heads, dropout=dropout) for _ in range(num_layers)
         ])
 
-        self.rms_norm = nn.RMSNorm(d_model)
+        self.rms_norm = nn.RMSNorm(d_model, eps=1e-6)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        token_ids = token_ids.to(self.device)
-
-        batch_size, seq_len = token_ids.size()
+        batch_size, seq_len = token_ids.shape
 
         # (batch_size, seq_len, token_ids) -> (batch_size, seq_len, d_model)
         x = self.embedding(token_ids)
 
         # output -> (batch_size, seq_len, d_model)
         for transformer_layer in self.transformer_layers:
-            x = transformer_layer(x, apply_casual_mask=True)
+            x = transformer_layer(x, is_casual=True)
 
         x = self.rms_norm(x)
 

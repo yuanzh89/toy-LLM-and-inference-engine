@@ -5,7 +5,7 @@ from group_query_attention import *
 from swiglu_ffn import *
 
 
-class Transformer(nn.Module):
+class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, d_ff: int, num_query_heads: int, num_kv_heads: int, dropout: float = 0.1):
         super().__init__()
 

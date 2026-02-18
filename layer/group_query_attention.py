@@ -93,7 +93,7 @@ class GroupQueryAttention(nn.Module):
         self.attn_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
         self.o_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
 
-    def forward(self, x: torch.Tensor, apply_casual_mask: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, is_casual: bool = True) -> torch.Tensor:
         batch_size, seq_len, d_model = x.size()
 
         residual = x
@@ -127,7 +127,7 @@ class GroupQueryAttention(nn.Module):
         # Broadcast the single Key head across all the Query heads in each group.
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        if apply_casual_mask:
+        if is_casual:
             # [seq_len, seq_len]
             casual_mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device))
             # [1, 1, seq_len, seq_len]
