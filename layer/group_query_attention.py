@@ -85,12 +85,11 @@ class GroupQueryAttention(nn.Module):
 
         self.rms_norm = nn.RMSNorm(d_model)
 
-        # We can fuse q_proj, k_proj, v_proj -> qkv_proj matrix for performance optimization.
         self.q_proj = nn.Linear(d_model, self.num_query_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d_model, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d_model, self.num_kv_heads * self.head_dim, bias=False)
-
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
         self.attn_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
         self.o_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
 
@@ -116,12 +115,16 @@ class GroupQueryAttention(nn.Module):
         # Apply RoPE to Q and K projections before attention calculation
         q, k = apply_rope(q, k)
 
-        # Expand KV heads to match Q heads
-        # [batch_size, num_query_heads, seq_len, head_dim]
-        k = k.repeat_interleave(self.query_to_kv_heads_ratio, dim=1)
-        v = v.repeat_interleave(self.query_to_kv_heads_ratio, dim=1)
+        # Reshape queries into groups
+        # [batch_size, num_kv_heads, query_to_kv_heads_ratio, seq_len, head_dim]
+        q = q.view(batch_size, self.num_kv_heads, self.query_to_kv_heads_ratio, seq_len, self.head_dim)
+        # [batch_size, num_kv_heads, 1, seq_len, head_dim]
+        k = k.unsqueeze(2)
+        # [batch_size, num_kv_heads, 1, seq_len, head_dim]
+        v = v.unsqueeze(2)
 
-        # [batch_size, num_query_heads, seq_len, seq_len]
+        # [batch_size, num_kv_heads, query_to_kv_heads_ratio, seq_len, seq_len]
+        # Broadcast the single Key head across all the Query heads in each group.
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
         if apply_casual_mask:
@@ -129,19 +132,20 @@ class GroupQueryAttention(nn.Module):
             casual_mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device))
             # [1, 1, seq_len, seq_len]
             casual_mask = casual_mask.unsqueeze(0).unsqueeze(0)
-            attn_scores = attn_scores.masked_fill(casual_mask == 0, float('-inf'))
+            attn_scores = attn_scores.masked_fill(casual_mask == 0, torch.finfo(attn_scores.dtype).min)
 
-        # Safe softmax
-        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True).values
+        # F.softmax is safe softmax by default
         attn_scores = F.softmax(attn_scores, dim=-1)
         attn_scores = self.attn_dropout(attn_scores)
 
-        # [batch_size, num_query_heads, seq_len, head_dim]
+        # [batch_size, num_kv_heads, query_to_kv_heads_ratio, seq_len, head_dim]
         attn_output = torch.matmul(attn_scores, v)
+        # [batch_size, num_query_heads, seq_len, head_dim]
+        attn_output = attn_output.view(batch_size, self.num_query_heads, seq_len, self.head_dim)
         # [batch_size, seq_len, num_query_heads, head_dim]
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.transpose(1, 2)
         # [batch_size, seq_len, d_model]
-        attn_output = attn_output.view(batch_size, seq_len, d_model)
+        attn_output = attn_output.reshape(batch_size, seq_len, d_model)
 
         # [batch_size, seq_len, d_model]
         output = self.o_proj(attn_output)
