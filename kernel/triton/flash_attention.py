@@ -13,6 +13,8 @@ def _flash_attention_fwd_kernel(
         H, SEQ_LEN,  # Constants
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr
 ):
+    NEG_INF = -1.0e9
+
     # 1. Identify the location in the grid
     # Each program instance handles one block of Query (one block of rows in the attention matrix)
     # inside a specific batch and head.
@@ -22,13 +24,15 @@ def _flash_attention_fwd_kernel(
     # Batch and Head indices
     # off_hz is a flattened index of (Batch * Head). We reconstruct them here.
     # Note: In this kernel setup, we treat (Batch * Head) as the Z-dimension.
+    b = off_hz // H
+    h = off_hz % H
 
     # Initialize offsets for pointers to Q, K, V
     # We need to jump to the correct Batch and Head for this specific program.
-    q_offset = off_hz * stride_qh
-    k_offset = off_hz * stride_kh
-    v_offset = off_hz * stride_vh
-    o_offset = off_hz * stride_oh
+    q_offset = b * stride_qb + h * stride_qh
+    k_offset = b * stride_kb + h * stride_kh
+    v_offset = b * stride_vb + h * stride_vh
+    o_offset = b * stride_ob + h * stride_oh
 
     # 2. Define block pointers
     # range of offsets for the Query block (rows)
@@ -41,7 +45,7 @@ def _flash_attention_fwd_kernel(
     # range of offsets for the Key/Value block (cols of attention matrix)
     offs_n = tl.arange(0, BLOCK_N)
 
-    # 3. Create Pointers
+    # 3. Create pointers
     # Pointers to Q: Base + (Batch/Head offset) + (Row offset * stride) + (Col offset * stride)
     Q_ptr = Q + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
 
@@ -57,11 +61,11 @@ def _flash_attention_fwd_kernel(
     q = tl.load(Q_ptr, mask=offs_m[:, None] < SEQ_LEN, other=0.0)
 
     # 5. Initialize Accumulators for Online Softmax
-    # m_i: running maximum (initialized to -inf)
+    # m_i: running maximum (initialized to NEG_INF)
     # l_i: running sum of exponentials (initialized to 1.0)
     # acc: accumulator for the output (initialized to 0.0)
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - NEG_INF
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
     # TODO:
@@ -90,8 +94,8 @@ def _flash_attention_fwd_kernel(
         # --- Online Softmax Logic ---
 
         # Mask out padding if we are near the end of the sequence
-        # If cols > SEQ_LEN, set attention score to -inf
-        qk = tl.where(cols[None, :] < SEQ_LEN, qk, float("-inf"))
+        # If cols > SEQ_LEN, set attention score to NEG_INF
+        qk = tl.where(cols[None, :] < SEQ_LEN, qk, NEG_INF)
 
         # 1. Get the current block's max
         m_ij = tl.max(qk, 1)  # Max along the columns (N dimension)
@@ -116,7 +120,7 @@ def _flash_attention_fwd_kernel(
         l_new = l_i * alpha + p_sum
 
         # 6. Load V block
-        v = tl.load(V_ptr, mask=cols[:, None] < SEQ_LEN, other=0.0)
+        v = tl.load(V_ptr, mask=cols[:, None] < SEQ_LEN, other=0.0).to(p.dtype)
 
         # 7. Update Accumulator (Attention Output)
         # acc = acc * alpha + P @ V
@@ -137,7 +141,7 @@ def _flash_attention_fwd_kernel(
 
     # 8. Store Output
     O_ptr = Out + o_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
-    tl.store(O_ptr, acc, mask=offs_m[:, None] < SEQ_LEN)
+    tl.store(O_ptr, acc, mask=(offs_m[:, None] < SEQ_LEN) & (offs_d[None, :] < BLOCK_D))
 
 
 def flash_attention(q, k, v):
@@ -175,7 +179,7 @@ def flash_attention(q, k, v):
         num_stages=num_stages,
     )
 
-    return 0
+    return o
 
 
 # --- Verification ---
