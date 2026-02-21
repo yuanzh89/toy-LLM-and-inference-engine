@@ -18,7 +18,7 @@ def _flash_attention_fwd_kernel(
     NEG_INF = -1.0e9
 
     # ------------------------------------------------------------------ #
-    # 1. Program identity                                                  #
+    # 1. Program identity                                                #
     # ------------------------------------------------------------------ #
     start_m = tl.program_id(0)  # which Q-row block
     off_hz = tl.program_id(1)  # flattened (batch, head) index
@@ -32,7 +32,7 @@ def _flash_attention_fwd_kernel(
     o_offset = b * stride_ob + h * stride_oh
 
     # ------------------------------------------------------------------ #
-    # 2. Block pointers via tl.make_block_ptr                             #
+    # 2. Block pointers via tl.make_block_ptr                            #
     # ------------------------------------------------------------------ #
 
     # Q  — load once; shape [BLOCK_M, BLOCK_D]
@@ -77,18 +77,18 @@ def _flash_attention_fwd_kernel(
     )
 
     # ------------------------------------------------------------------ #
-    # 3. Row / col index vectors (still needed for the causal mask)       #
+    # 3. Row / col index vectors (still needed for the causal mask)      #
     # ------------------------------------------------------------------ #
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)  # Q rows
     offs_n = tl.arange(0, BLOCK_N)  # K/V rows
 
     # ------------------------------------------------------------------ #
-    # 4. Load Q once into registers                                        #
+    # 4. Load Q once into registers                                      #
     # ------------------------------------------------------------------ #
     q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
     # ------------------------------------------------------------------ #
-    # 5. Online-softmax accumulators                                       #
+    # 5. Online-softmax accumulators                                     #
     # ------------------------------------------------------------------ #
     m_i = tl.full([BLOCK_M], NEG_INF, dtype=tl.float32)  # running max
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)  # running sum of exp
@@ -101,13 +101,13 @@ def _flash_attention_fwd_kernel(
         cols = start_n + offs_n
 
         # ---- Load K as [BLOCK_N, BLOCK_D], then EXPLICITLY transpose ----
-        k_T = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        k = tl.trans(k_T)  # [BLOCK_D, BLOCK_N] — explicit transpose
+        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        k_T = tl.trans(k)  # [BLOCK_D, BLOCK_N] — explicit transpose
 
-        # ---- Compute Q @ K^T  →  [BLOCK_M, BLOCK_N] --------------------
-        qk = tl.dot(q, k)
+        # ---- Compute Q @ K^T  →  [BLOCK_M, BLOCK_N] ----------------------
+        qk = tl.dot(q, k_T)
 
-        # ---- Causal mask (typo fix: "casual" → "causal") ----------------
+        # ---- Causal mask -------------------------------------------------
         causal_mask = offs_m[:, None] >= cols[None, :]
         qk = tl.where(causal_mask, qk, NEG_INF)
 
@@ -138,7 +138,7 @@ def _flash_attention_fwd_kernel(
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
     # ------------------------------------------------------------------ #
-    # 7. Normalise and store                                               #
+    # 7. Normalise and store                                             #
     # ------------------------------------------------------------------ #
     acc = acc / l_i[:, None]
 
@@ -146,6 +146,7 @@ def _flash_attention_fwd_kernel(
 
 
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    # Input shape of q, k, v: [batch_size, num_heads, seq_len, head_dim]
     B, H, seq_len, D = q.shape
     sm_scale = D ** -0.5
     o = torch.empty_like(q)
