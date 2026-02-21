@@ -18,6 +18,7 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
+    # Num of tokens per KV cache block
     block_size = 256
     counter = count()
 
@@ -28,6 +29,7 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
+        # Num of tokens with KV cache
         self.num_cached_tokens = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
@@ -58,17 +60,20 @@ class Sequence:
 
     @property
     def num_cached_blocks(self):
+        """Num of KV cache blocks occupied by this sequence."""
         return self.num_cached_tokens // self.block_size
 
     @property
     def num_blocks(self):
+        """Num of KV cache blocks required to fully cache this sequence."""
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
-    def block(self, i):
+    def block(self, i) -> list[int]:
+        """Get the token ids assigned to the i-th KV cache block."""
         assert 0 <= i < self.num_blocks
         return self.token_ids[i * self.block_size: (i + 1) * self.block_size]
 
