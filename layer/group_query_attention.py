@@ -71,7 +71,7 @@ class GroupQueryAttention(nn.Module):
     def __init__(self, d_model: int, num_query_heads: int, num_kv_heads: int, dropout: float = 0.1):
         super().__init__()
 
-        assert d_model % num_query_heads == 0, "d_model must be divided by num_query_heads"
+        assert d_model % num_query_heads == 0, "d_model must be divisible by num_query_heads"
         assert num_query_heads >= num_kv_heads, "num_query_heads must be greater than or equal to num_kv_heads"
         assert num_query_heads % num_kv_heads == 0, "num_query_heads must be divisible by num_kv_heads"
 
