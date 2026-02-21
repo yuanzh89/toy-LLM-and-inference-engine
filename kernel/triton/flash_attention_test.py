@@ -1,14 +1,14 @@
 import pytest
 import torch
 
+from flash_attention import flash_attention
+
 # ---------------------------------------------------------------------------
 # Guard: skip entire module if CUDA is unavailable
 # ---------------------------------------------------------------------------
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA not available"
 )
-
-from flash_attention import flash_attention  # noqa: E402  (import after guard)
 
 
 # ---------------------------------------------------------------------------
