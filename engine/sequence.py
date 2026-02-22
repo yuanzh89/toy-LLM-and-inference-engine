@@ -1,14 +1,8 @@
 from copy import copy
-from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
 
-
-@dataclass
-class SamplingParams:
-    temperature: float = 1.0
-    max_tokens: int = 64
-    ignore_eos: bool = False
+from sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
