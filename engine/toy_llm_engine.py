@@ -4,7 +4,7 @@ from transformers import AutoTokenizer, AutoConfig
 from layer.toy_llm_model import ToyLLMModel
 
 
-class ToyLLM:
+class ToyLLMEngine:
     def __init__(self, tokenizer_name: str | None = None, num_query_heads: int = 4, num_kv_heads: int = 2,
                  dropout: float = 0.1):
         self.tokenizer_name = 'bert-base-uncased' if tokenizer_name is None else tokenizer_name
