@@ -4,10 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from rope import apply_rope
+from layer.rope import apply_rope
 
 
-class GroupQueryAttention(nn.Module):
+class FusedGroupQueryAttention(nn.Module):
     """
     Grouped-Query Attention (GQA) module.
 
@@ -54,7 +54,7 @@ class GroupQueryAttention(nn.Module):
         super().__init__()
 
         assert d_model % num_query_heads == 0, "d_model must be divisible by num_query_heads"
-        assert num_query_heads >= num_kv_heads, "num_query_heads must be greater than or equal to num_kv_heads"
+        assert num_query_heads >= num_kv_heads, "num_query_heads must be >= num_kv_heads"
         assert num_query_heads % num_kv_heads == 0, "num_query_heads must be divisible by num_kv_heads"
 
         self.d_model = d_model
@@ -67,9 +67,8 @@ class GroupQueryAttention(nn.Module):
 
         self.rms_norm = nn.RMSNorm(d_model, eps=1e-9)
 
-        self.q_proj = nn.Linear(d_model, self.num_query_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(d_model, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(d_model, self.num_kv_heads * self.head_dim, bias=False)
+        # Fused Q, K, V projection matrix
+        self.qkv_proj = nn.Linear(d_model, (self.num_query_heads + 2 * self.num_kv_heads) * self.head_dim, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
         self.attn_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(p=self.dropout)
@@ -83,9 +82,17 @@ class GroupQueryAttention(nn.Module):
         # Pre-norm: [batch_size, seq_len, d_model]
         x = self.rms_norm(x)
 
-        q = self.q_proj(x)  # [batch_size, seq_len, num_query_heads * head_dim]
-        k = self.k_proj(x)  # [batch_size, seq_len, num_kv_heads * head_dim]
-        v = self.v_proj(x)  # [batch_size, seq_len, num_kv_heads * head_dim]
+        qkv = self.qkv_proj(x)
+
+        q, k, v = torch.split(
+            qkv,
+            split_size_or_sections=[
+                self.num_query_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim
+            ],
+            dim=-1
+        )
 
         # [batch_size, num_query_heads, seq_len, head_dim]
         q = q.view(batch_size, seq_len, self.num_query_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -101,9 +108,9 @@ class GroupQueryAttention(nn.Module):
         # [batch_size, num_kv_heads, query_to_kv_heads_ratio, seq_len, head_dim]
         q = q.view(batch_size, self.num_kv_heads, self.query_to_kv_heads_ratio, seq_len, self.head_dim)
         # [batch_size, num_kv_heads, 1, seq_len, head_dim]
-        k = k.unsqueeze(2)
+        k = k.unsqueeze(dim=2)
         # [batch_size, num_kv_heads, 1, seq_len, head_dim]
-        v = v.unsqueeze(2)
+        v = v.unsqueeze(dim=2)
 
         # [batch_size, num_kv_heads, query_to_kv_heads_ratio, seq_len, seq_len]
         # Broadcast the single Key head across all the Query heads within each group.
