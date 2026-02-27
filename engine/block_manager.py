@@ -1,7 +1,5 @@
 from itertools import count
 
-import torch
-
 from kv_cache_block import Block
 from prefix_caching import BlockTrieTree, BlockTrieNode
 from sequence import Sequence
@@ -61,13 +59,18 @@ class BlockManager:
     """
     counter = count()
 
-    def __init__(self, max_block_size: int, max_token_size_per_kv_cache_block: int):
+    def __init__(self, max_block_size: int, max_token_size_per_kv_cache_block: int, num_transformer_layers: int):
         self.max_block_size = max_block_size
         self.max_token_size_per_kv_cache_block = max_token_size_per_kv_cache_block
+        self.num_transformer_layers = num_transformer_layers
         self.id_to_block = {}
         self.hash_to_block = {}
         self.block_trie_tree = BlockTrieTree()
-        self.num_blocks = 0
+        self.blocks = []
+
+    @property
+    def num_blocks(self):
+        return len(self.blocks)
 
     def available_blocks(self) -> int:
         return self.max_block_size - self.num_blocks
@@ -97,41 +100,49 @@ class BlockManager:
             if chunk_key not in trie_node.children:
                 break
             trie_node = trie_node.children[chunk_key]
+            # Add reference to the sequence to protect cache hit blocks from eviction.
+            trie_node.block.inc_ref_count()
             blocks.append(trie_node.block)
 
         needed_kv_cache_blocks = num_chunks - len(blocks)
-        while needed_kv_cache_blocks > self.available_blocks():
-            if not self.evict_blocks():
-                # Failed to make space for new allocations
-                # Return False to indicate this process failed
-                return False
+        if not self.evict_blocks(needed_kv_cache_blocks):
+            # Failed to make space for new allocations
+            # Return False to indicate failure of this process
+            for block in blocks:
+                block.remove_reference(seq)
+            return False
 
         # At this point, we are ready to allocate new blocks for the sequence
         chunk_index = len(blocks)
         while chunk_index < len(token_ids_chunks):
             token_id_chunk = token_ids_chunks[chunk_index]
-            blocks.append(self.allocate_block(token_id_chunk))
+            block = self.allocate_block(token_id_chunk, trie_node)
+            block.inc_ref_count()
+            blocks.append(block)
+            trie_node = trie_node.children[tuple(token_id_chunk)]
             chunk_index += 1
 
-        # Update reference between KV cache block and sequence.
-        BlockManager.add_reference(seq, blocks)
+        # Add blocks reference to Sequence
+        seq.update_kv_cache_blocks(blocks)
 
         return True
 
-    @staticmethod
-    def add_reference(seq: Sequence, blocks: list[Block]):
-        """
-        This function is responsible for adding references between Sequence and a list of KV cache blocks.
-        """
-        seq.update_kv_cache_blocks(blocks)
-        for block in blocks:
-            block.add_reference(seq)
+    def evict_blocks(self, needed_kv_cache_blocks: int) -> bool:
+        """Return whether we were able to evict needed_kv_cache_blocks number of KV cache blocks."""
+        # We need to sort this on fly because when we add and remove sequences during inference.
+        # The ref_count of each block may dynamically change
+        self.blocks.sort(reverse=True)
 
-    def evict_blocks(self) -> bool:
-        """Return whether we were able to evict KV cache blocks."""
-        pass
+        while needed_kv_cache_blocks > 0 and self.blocks and self.blocks[-1].ref_count == 0:
+            block_to_evict = self.blocks.pop()
+            # Remove block from TrieTree
+            parent = block_to_evict.parent
 
-    def allocate_block(self, token_ids: list[int]) -> Block:
+            needed_kv_cache_blocks -= 1
+
+        return needed_kv_cache_blocks == 0
+
+    def allocate_block(self, token_ids: list[int], parent_trie_node: BlockTrieNode | None) -> Block:
         """
         Given a full or partial chunk of token_ids,
         this function allocates a new block and returns it.
@@ -142,8 +153,9 @@ class BlockManager:
           2. Update it into the Trie tree for prefix caching
         """
         block_id = next(BlockManager.counter)
-        block = Block(block_id, token_ids)
-        self.num_blocks += 1
+        block = Block(block_id, token_ids, self.num_transformer_layers)
+        self.blocks.append(block)
+        if parent_trie_node is not None:
+            parent_trie_node.add_child(token_ids, block)
 
         return block
-
