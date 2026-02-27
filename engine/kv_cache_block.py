@@ -5,98 +5,244 @@ import torch
 
 class Block:
     """
-    A block of physical KV cache can be referred by multiple sequences at the same time, recorded by _ref_count.
-    Serving just one layers
+    A single physical KV-cache block that may be shared by multiple sequences simultaneously.
+
+    Each block stores pre-computed key and value tensors for every transformer layer,
+    covering up to ``max_token_size_per_kv_cache_block`` token positions.  Sharing is
+    tracked via ``ref_count``; a block with ``ref_count == 0`` is safe to evict.
+
+    Lifecycle
+    ---------
+    * **Prefill** – ``prefill_write_kv_cache`` writes the full key/value tensors for
+      every token in the block at once.
+    * **Decode** – ``decode_append_kv_cache`` appends one (or a few, for speculative
+      decoding) new key/value slices to an already-populated block.
+
+    Attributes
+    ----------
+    block_id : int
+        Unique identifier assigned by :class:`BlockManager`.
+    token_ids : list[int]
+        Token IDs whose KV cache is stored in this block.  Grows during decoding.
+    num_transformer_layers : int
+        Total number of transformer layers; determines the length of the k/v lists.
+    max_token_size_per_kv_cache_block : int
+        Maximum number of token positions this block can hold.
+    ref_count : int
+        Number of active sequences currently referencing this block.
+    k_cache : list[torch.Tensor | None]
+        Per-layer key tensors.  ``None`` means the layer has not been computed yet.
+    v_cache : list[torch.Tensor | None]
+        Per-layer value tensors.  ``None`` means the layer has not been computed yet.
+    trie_tree_depth : int
+        Depth of this block's node in the prefix-caching :class:`BlockTrieTree`.
+        Used for eviction ordering: deeper blocks are evicted first.
     """
 
-    def __init__(self, block_id: int, token_ids: list[int],
-                 num_transformer_layers: int, max_token_size_per_kv_cache_block: int = 16):
+    def __init__(
+        self,
+        block_id: int,
+        token_ids: list[int],
+        num_transformer_layers: int,
+        max_token_size_per_kv_cache_block: int = 16,
+    ):
         self.block_id = block_id
         self.token_ids: list[int] = copy(token_ids)
         self.num_transformer_layers = num_transformer_layers
         self.max_token_size_per_kv_cache_block = max_token_size_per_kv_cache_block
-        self.ref_count = 1
+        self.ref_count: int = 0
         self.k_cache: list[torch.Tensor | None] = [None] * self.num_transformer_layers
         self.v_cache: list[torch.Tensor | None] = [None] * self.num_transformer_layers
-        # self.referred_seqs = set()
-        self.trie_tree_depth = 0
+        # Set by BlockManager when this block is inserted into the trie tree.
+        self.trie_tree_depth: int = 0
+
+    # ------------------------------------------------------------------
+    # Comparison / sizing
+    # ------------------------------------------------------------------
 
     def __lt__(self, other: "Block") -> bool:
         """
-        Comparator used to compare two blocks during eviction.
-        The winning block will be evicted first follow the following rules:
-        1. Evicted blocks must be not actively referred by any active sequences.
-        2. When multiple blocks are available for eviction, we evict the block with max depth in trie tree.
-        Because the deeper block generally has the lower chance to be reused.
+        Ordering used during eviction candidate selection.
+
+        Rules (highest priority first):
+        1. Only blocks with ``ref_count == 0`` are eligible for eviction.
+           Blocks with a lower ``ref_count`` compare *less-than* so they sort
+           toward the eviction end of the list.
+        2. Among equally-eligible blocks, prefer to evict the one with the
+           **greatest** trie-tree depth, because deep blocks represent long,
+           request-specific suffixes that are unlikely to be reused as a
+           common prefix.
+
+        This comparator is designed for use with ``list.sort(reverse=True)``:
+        the element at the tail of the sorted list is the best eviction candidate.
         """
         if self.ref_count != other.ref_count:
             return self.ref_count < other.ref_count
-        return self.trie_tree_depth < other.trie_tree_depth
+        return self.trie_tree_depth > other.trie_tree_depth
 
-    def token_ids(self):
-        return tuple(self.token_ids)
+    def __len__(self) -> int:
+        """Return the number of token IDs currently stored in this block."""
+        return len(self.token_ids)
+
+    # ------------------------------------------------------------------
+    # Reference counting
+    # ------------------------------------------------------------------
+
+    def inc_ref_count(self) -> None:
+        """Increment the reference count when a new sequence starts using this block."""
+        self.ref_count += 1
+
+    def dec_ref_count(self) -> None:
+        """
+        Decrement the reference count when a sequence releases this block.
+
+        The caller is responsible for ensuring ``ref_count`` never goes below zero.
+        When ``ref_count`` reaches zero the block becomes eligible for eviction.
+        """
+        self.ref_count -= 1
+
+    # ------------------------------------------------------------------
+    # KV-cache access
+    # ------------------------------------------------------------------
 
     def is_empty(self, layer_id: int) -> bool:
-        """Return whether the KV cache block is empty at a given layer_id"""
+        """
+        Return ``True`` if the KV cache for *layer_id* has not been written yet.
+
+        A block is considered empty for a given layer when either the key or the
+        value tensor is ``None``.  This signals the attention layer that it must
+        compute (rather than read) the KV tensors for this block.
+
+        Parameters
+        ----------
+        layer_id : int
+            Zero-based transformer layer index.
+        """
         assert 0 <= layer_id < self.num_transformer_layers
         return self.k_cache[layer_id] is None or self.v_cache[layer_id] is None
 
-    def prefill_write_kv_cache(self, layer_id: int, k_cache: torch.Tensor, v_cache: torch.Tensor):
+    def prefill_write_kv_cache(
+        self, layer_id: int, k_cache: torch.Tensor, v_cache: torch.Tensor
+    ) -> None:
         """
-        k_cache shape: [batch_size, num_heads, seq_len, head_dim]
-        v_cache shape: [batch_size, num_heads, seq_len, head_dim]
+        Store the full prefill KV tensors for a transformer layer.
+
+        Called once per layer during the prefill pass after computing the key and
+        value projections for all tokens in this block.
+
+        Parameters
+        ----------
+        layer_id : int
+            Zero-based transformer layer index.
+        k_cache : torch.Tensor
+            Key tensor of shape ``[batch_size, num_heads, seq_len, head_dim]``.
+        v_cache : torch.Tensor
+            Value tensor of shape ``[batch_size, num_heads, seq_len, head_dim]``.
         """
         assert 0 <= layer_id < self.num_transformer_layers
         _, _, k_seq_len, _ = k_cache.shape
         _, _, v_seq_len, _ = v_cache.shape
         assert k_seq_len == v_seq_len, "Sequence length mismatch between K and V"
-        assert 0 < k_seq_len <= self.max_token_size_per_kv_cache_block, "Sequence length exceeds max_token_size_per_kv_cache_block"
+        assert (
+            0 < k_seq_len <= self.max_token_size_per_kv_cache_block
+        ), "Sequence length exceeds max_token_size_per_kv_cache_block"
 
         self.k_cache[layer_id] = k_cache
         self.v_cache[layer_id] = v_cache
 
     def read_kv_cache(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Read the stored KV tensors for a transformer layer.
+
+        Used during attention computation to retrieve pre-computed key/value
+        tensors for cache-hit blocks, avoiding redundant forward passes.
+
+        Parameters
+        ----------
+        layer_id : int
+            Zero-based transformer layer index.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            ``(k_cache, v_cache)`` both of shape
+            ``[batch_size, num_heads, seq_len, head_dim]``.
+
+        Raises
+        ------
+        AssertionError
+            If the requested layer has not been written yet (i.e. ``is_empty`` is True).
+        """
         assert 0 <= layer_id < self.num_transformer_layers
         k_cache = self.k_cache[layer_id]
         v_cache = self.v_cache[layer_id]
-        assert k_cache is not None
-        assert v_cache is not None
-
+        assert k_cache is not None, f"K cache for layer {layer_id} has not been written"
+        assert v_cache is not None, f"V cache for layer {layer_id} has not been written"
         return k_cache, v_cache
 
-    def inc_ref_count(self):
-        # self.referred_seqs.add(seq)
-        self.ref_count += 1
-
-    def dec_ref_count(self):
-        # self.referred_seqs.remove(seq)
-        self.ref_count -= 1
-
-    def __len__(self) -> int:
-        return len(self.token_ids)
-
-    def decode_append_token_ids(self, new_token_ids: list[int]) -> None:
-        assert len(new_token_ids) > 0
-        assert len(self.token_ids) + len(new_token_ids) <= self.max_token_size_per_kv_cache_block
-        self.token_ids.extend(new_token_ids)
-
-    def decode_append_kv_cache(self, layer_id: int, k_cache: torch.Tensor, v_cache: torch.Tensor):
+    def decode_append_kv_cache(
+        self, layer_id: int, k_cache: torch.Tensor, v_cache: torch.Tensor
+    ) -> None:
         """
-        k_tensor shape: [batch_size, num_heads, seq_len == 1, head_dim]
-        v_tensor shape: [batch_size, num_heads, seq_len == 1, head_dim]
+        Append new KV tensors to an existing block during the decode phase.
 
-        Usually, seq_len should always be 1 for regular autogressive decoding.
-        Unless using speculative decoding, then the seq_len might be larger than 1
+        During autoregressive decoding each step produces a single new token
+        whose key/value vectors are concatenated onto the tensors already stored
+        in the block.  For speculative decoding ``seq_len`` may be greater than 1.
+
+        Parameters
+        ----------
+        layer_id : int
+            Zero-based transformer layer index.
+        k_cache : torch.Tensor
+            New key tensor of shape ``[batch_size, num_heads, seq_len, head_dim]``.
+            ``seq_len`` is typically 1 for standard autoregressive decoding.
+        v_cache : torch.Tensor
+            New value tensor of shape ``[batch_size, num_heads, seq_len, head_dim]``.
+
+        Raises
+        ------
+        AssertionError
+            If the block has not been populated by ``prefill_write_kv_cache`` first,
+            or if appending would exceed ``max_token_size_per_kv_cache_block``.
         """
-
         assert 0 <= layer_id < self.num_transformer_layers
+        assert self.k_cache[layer_id] is not None, (
+            f"Layer {layer_id} has not been written via prefill_write_kv_cache; "
+            "decode_append_kv_cache requires an existing cache to extend."
+        )
         _, _, k_seq_len, _ = k_cache.shape
         _, _, v_seq_len, _ = v_cache.shape
         assert k_seq_len == v_seq_len, "Sequence length mismatch between K and V"
 
         existing_kv_seq_len = self.k_cache[layer_id].size(2)
-        assert 0 < existing_kv_seq_len + k_seq_len <= self.max_token_size_per_kv_cache_block, "Sequence length exceeds max_token_size_per_kv_cache_block"
+        assert (
+            0 < existing_kv_seq_len + k_seq_len <= self.max_token_size_per_kv_cache_block
+        ), "Appending would exceed max_token_size_per_kv_cache_block"
 
-        # Concatenate new KV cache tensors to existing KV cache tensors along the seq_len dimension.
-        self.k_cache[layer_id] = torch.concat([self.k_cache[layer_id], k_cache], dim=2)
-        self.v_cache[layer_id] = torch.concat([self.v_cache[layer_id], v_cache], dim=2)
+        # Concatenate along the sequence-length dimension (dim=2).
+        self.k_cache[layer_id] = torch.cat([self.k_cache[layer_id], k_cache], dim=2)
+        self.v_cache[layer_id] = torch.cat([self.v_cache[layer_id], v_cache], dim=2)
+
+    def decode_append_token_ids(self, new_token_ids: list[int]) -> None:
+        """
+        Record newly decoded token IDs in this block.
+
+        Should be called alongside ``decode_append_kv_cache`` to keep the block's
+        token list consistent with its stored tensors.
+
+        Parameters
+        ----------
+        new_token_ids : list[int]
+            One or more token IDs produced during the decode step.
+
+        Raises
+        ------
+        AssertionError
+            If ``new_token_ids`` is empty, or if appending would exceed the block capacity.
+        """
+        assert len(new_token_ids) > 0
+        assert (
+            len(self.token_ids) + len(new_token_ids) <= self.max_token_size_per_kv_cache_block
+        ), "Appending token IDs would exceed max_token_size_per_kv_cache_block"
+        self.token_ids.extend(new_token_ids)
