@@ -2,12 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformer import TransformerBlock
+from transformer_block import TransformerBlock
 
 
 class ToyLLMModel(nn.Module):
     def __init__(self, vocab_size: int, d_model: int, num_query_heads: int, num_kv_heads: int, d_ff: int,
-                 num_layers: int,
+                 num_transformer_layers: int,
                  dropout: float = 0.1):
         super().__init__()
 
@@ -18,7 +18,7 @@ class ToyLLMModel(nn.Module):
         self.lm_head.weight = self.embedding.weight
 
         self.transformer_layers = nn.ModuleList([
-            TransformerBlock(d_model, d_ff, num_query_heads, num_kv_heads, dropout=dropout) for _ in range(num_layers)
+            TransformerBlock(d_model, d_ff, num_query_heads, num_kv_heads, dropout=dropout) for _ in range(num_transformer_layers)
         ])
 
         self.rms_norm = nn.RMSNorm(d_model, eps=1e-6)

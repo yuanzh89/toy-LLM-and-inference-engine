@@ -164,7 +164,8 @@ class Sequence:
 
     def release(self) -> None:
         """
-        Release all KV-cache block references held by this sequence.
+        Explicitly release all KV-cache block references.
+        Must be called by the scheduler.
 
         Decrements the ``ref_count`` of every non-``None`` block so that the
         :class:`~block_manager.BlockManager` knows these blocks are no longer

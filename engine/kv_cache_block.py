@@ -40,11 +40,11 @@ class Block:
     """
 
     def __init__(
-        self,
-        block_id: int,
-        token_ids: list[int],
-        num_transformer_layers: int,
-        max_token_size_per_kv_cache_block: int = 16,
+            self,
+            block_id: int,
+            token_ids: list[int],
+            num_transformer_layers: int,
+            max_token_size_per_kv_cache_block: int = 16,
     ):
         self.block_id = block_id
         self.token_ids: list[int] = copy(token_ids)
@@ -54,6 +54,7 @@ class Block:
         self.k_cache: list[torch.Tensor | None] = [None] * self.num_transformer_layers
         self.v_cache: list[torch.Tensor | None] = [None] * self.num_transformer_layers
         # Set by BlockManager when this block is inserted into the trie tree.
+        # trie_tree_depth == 0 means this block is pending, not inserted into prefix caching TrieTree yet.
         self.trie_tree_depth: int = 0
 
     # ------------------------------------------------------------------
@@ -83,6 +84,10 @@ class Block:
     def __len__(self) -> int:
         """Return the number of token IDs currently stored in this block."""
         return len(self.token_ids)
+
+    def can_append(self) -> bool:
+        """Returns whether this block can be appended."""
+        return self.trie_tree_depth == 0
 
     # ------------------------------------------------------------------
     # Reference counting
@@ -122,7 +127,7 @@ class Block:
         return self.k_cache[layer_id] is None or self.v_cache[layer_id] is None
 
     def prefill_write_kv_cache(
-        self, layer_id: int, k_cache: torch.Tensor, v_cache: torch.Tensor
+            self, layer_id: int, k_cache: torch.Tensor, v_cache: torch.Tensor
     ) -> None:
         """
         Store the full prefill KV tensors for a transformer layer.
@@ -144,7 +149,7 @@ class Block:
         _, _, v_seq_len, _ = v_cache.shape
         assert k_seq_len == v_seq_len, "Sequence length mismatch between K and V"
         assert (
-            0 < k_seq_len <= self.max_token_size_per_kv_cache_block
+                0 < k_seq_len <= self.max_token_size_per_kv_cache_block
         ), "Sequence length exceeds max_token_size_per_kv_cache_block"
 
         self.k_cache[layer_id] = k_cache
@@ -180,8 +185,8 @@ class Block:
         assert v_cache is not None, f"V cache for layer {layer_id} has not been written"
         return k_cache, v_cache
 
-    def decode_append_kv_cache(
-        self, layer_id: int, k_cache: torch.Tensor, v_cache: torch.Tensor
+    def decode_append_token_ids_and_kv_cache(
+            self, layer_id: int, new_token_ids: list[int], k_cache: torch.Tensor, v_cache: torch.Tensor,
     ) -> None:
         """
         Append new KV tensors to an existing block during the decode phase.
@@ -194,6 +199,8 @@ class Block:
         ----------
         layer_id : int
             Zero-based transformer layer index.
+        new_token_ids : list[int]
+            One or more token IDs produced during the decode step.
         k_cache : torch.Tensor
             New key tensor of shape ``[batch_size, num_heads, seq_len, head_dim]``.
             ``seq_len`` is typically 1 for standard autoregressive decoding.
@@ -207,42 +214,27 @@ class Block:
             or if appending would exceed ``max_token_size_per_kv_cache_block``.
         """
         assert 0 <= layer_id < self.num_transformer_layers
+        assert len(new_token_ids) > 0
+
+        assert (
+                len(self.token_ids) + len(new_token_ids) <= self.max_token_size_per_kv_cache_block
+        ), "Appending token IDs would exceed max_token_size_per_kv_cache_block"
+
         assert self.k_cache[layer_id] is not None, (
             f"Layer {layer_id} has not been written via prefill_write_kv_cache; "
             "decode_append_kv_cache requires an existing cache to extend."
         )
         _, _, k_seq_len, _ = k_cache.shape
         _, _, v_seq_len, _ = v_cache.shape
-        assert k_seq_len == v_seq_len, "Sequence length mismatch between K and V"
+        assert len(new_token_ids) == k_seq_len == v_seq_len, "Sequence length mismatch between new_token_ids, K and V"
 
         existing_kv_seq_len = self.k_cache[layer_id].size(2)
         assert (
-            0 < existing_kv_seq_len + k_seq_len <= self.max_token_size_per_kv_cache_block
+                0 < existing_kv_seq_len + k_seq_len <= self.max_token_size_per_kv_cache_block
         ), "Appending would exceed max_token_size_per_kv_cache_block"
+
+        self.token_ids.extend(new_token_ids)
 
         # Concatenate along the sequence-length dimension (dim=2).
         self.k_cache[layer_id] = torch.cat([self.k_cache[layer_id], k_cache], dim=2)
         self.v_cache[layer_id] = torch.cat([self.v_cache[layer_id], v_cache], dim=2)
-
-    def decode_append_token_ids(self, new_token_ids: list[int]) -> None:
-        """
-        Record newly decoded token IDs in this block.
-
-        Should be called alongside ``decode_append_kv_cache`` to keep the block's
-        token list consistent with its stored tensors.
-
-        Parameters
-        ----------
-        new_token_ids : list[int]
-            One or more token IDs produced during the decode step.
-
-        Raises
-        ------
-        AssertionError
-            If ``new_token_ids`` is empty, or if appending would exceed the block capacity.
-        """
-        assert len(new_token_ids) > 0
-        assert (
-            len(self.token_ids) + len(new_token_ids) <= self.max_token_size_per_kv_cache_block
-        ), "Appending token IDs would exceed max_token_size_per_kv_cache_block"
-        self.token_ids.extend(new_token_ids)
