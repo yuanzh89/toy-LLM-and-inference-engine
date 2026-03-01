@@ -95,7 +95,8 @@ class GroupQueryAttention(nn.Module):
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
 
         # Apply RoPE to Q and K projections before attention calculation
-        q, k = apply_rope(q, k)
+        apply_rope(q, self.head_dim)
+        apply_rope(k, self.head_dim)
 
         # Reshape q, k, v into groups
         # [batch_size, num_kv_heads, query_to_kv_heads_ratio, seq_len, head_dim]

@@ -51,6 +51,7 @@ class Block:
         self.num_transformer_layers = num_transformer_layers
         self.max_token_size_per_kv_cache_block = max_token_size_per_kv_cache_block
         self.ref_count: int = 0
+        # Shape of each KV cache tensor: [batch_size, seq_len, num_kv_heads, head_dim], with RoPE already applied on K
         self.k_cache: list[torch.Tensor | None] = [None] * self.num_transformer_layers
         self.v_cache: list[torch.Tensor | None] = [None] * self.num_transformer_layers
         # Set by BlockManager when this block is inserted into the trie tree.

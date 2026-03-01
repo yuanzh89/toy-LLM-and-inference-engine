@@ -2,66 +2,67 @@ import torch
 
 
 def apply_rope(
-        q: torch.Tensor,
-        k: torch.Tensor,
+        x: torch.Tensor,
         rotary_dim: int,
         base: int = 10000,
         start_pos: int = 0,
-):
+) -> None:
     """
-    q: (B, T, num_query_heads, head_dim)
-    k: (B, T, num_kv_heads, head_dim)
-    rotary_dim: how many dims to apply RoPE to (must be even)
-    start_pos: offset for KV cache / decoding
+    Applies Rotary Position Embedding (RoPE) in-place to the first `rotary_dim`
+    dimensions of the head dimension of `x`.
+
+    RoPE encodes position information by rotating pairs of adjacent head
+    dimensions by position-dependent angles. Dimensions beyond `rotary_dim`
+    are left unchanged.
+
+    Args:
+        x:           Tensor of shape (B, T, num_heads, head_dim).
+        rotary_dim:  Number of head dimensions to rotate. Must be even and
+                     <= head_dim.
+        base:        Base frequency for the sinusoidal schedule (default 10000).
+        start_pos:   Token offset used during decoding with a KV cache. Set to
+                     the number of tokens already in the cache so that newly
+                     generated tokens receive the correct absolute positions.
     """
+    B, T, H, D = x.shape
+    device, dtype = x.device, x.dtype
 
-    B, T, Hq, D = q.shape
-    _, _, Hk, _ = k.shape
-    device = q.device
+    assert rotary_dim % 2 == 0, "rotary_dim must be even"
+    assert rotary_dim <= D, "rotary_dim must be <= head_dim"
 
-    assert rotary_dim % 2 == 0
-    assert rotary_dim <= D
+    # ------------------------------------------------------------------ #
+    # 1. Build per-dimension inverse frequencies.                         #
+    #    dim_indices shape: (rotary_dim / 2,)                             #
+    # ------------------------------------------------------------------ #
+    dim_indices = torch.arange(0, rotary_dim, 2, device=device)
+    inv_freq = (1.0 / (base ** (dim_indices.float() / rotary_dim))).to(dtype)
 
-    # Split rotary / non-rotary parts
-    q_rot_part = q[..., :rotary_dim]  # (B, T, Hq, rotary_dim)
-    q_pass = q[..., rotary_dim:]  # (B, T, Hq, D - rotary_dim)
+    # ------------------------------------------------------------------ #
+    # 2. Compute per-position angles, one per frequency.                  #
+    #    positions shape : (T,)                                           #
+    #    angles    shape : (T, rotary_dim / 2)                            #
+    # ------------------------------------------------------------------ #
+    positions = torch.arange(start_pos, start_pos + T, device=device, dtype=dtype)
+    angles = positions[:, None] * inv_freq[None, :]  # (T, rotary_dim/2)
 
-    k_rot_part = k[..., :rotary_dim]  # (B, T, Hk, rotary_dim)
-    k_pass = k[..., rotary_dim:]  # (B, T, Hk, D - rotary_dim)
-
-    # Build frequencies
-    dim = torch.arange(0, rotary_dim, 2, device=device)  # (rotary_dim/2,)
-    inv_freq = 1.0 / (base ** (dim.float() / rotary_dim))
-
-    # Positions (with offset for decoding)
-    pos = torch.arange(start_pos, start_pos + T, device=device)  # (T,)
-    angles = pos[:, None] * inv_freq[None, :]  # (T, rotary_dim/2)
-
-    sin = angles.sin()[None, :, None, :]  # (1, T, 1, rotary_dim/2)
+    # Broadcast over batch and head dimensions: (1, T, 1, rotary_dim/2)
     cos = angles.cos()[None, :, None, :]
+    sin = angles.sin()[None, :, None, :]
 
-    # Rotate Q
-    q_even = q_rot_part[..., 0::2]  # (B, T, Hq, rotary_dim/2)
-    q_odd = q_rot_part[..., 1::2]
+    # ------------------------------------------------------------------ #
+    # 3. Rotate only the first `rotary_dim` head dims, in-place.         #
+    #    x_rot shape: (B, T, H, rotary_dim)                              #
+    #    Even indices hold one element of each rotation pair;            #
+    #    odd indices hold the other.                                      #
+    # ------------------------------------------------------------------ #
+    x_rot = x[..., :rotary_dim]  # view into x; writes propagate back
 
-    q_rotated = torch.stack(
-        (q_even * cos - q_odd * sin,
-         q_even * sin + q_odd * cos),
-        dim=-1
-    ).flatten(-2)  # (B, T, Hq, rotary_dim)
+    x_even = x_rot[..., 0::2].clone()  # (B, T, H, rotary_dim/2)
+    x_odd  = x_rot[..., 1::2].clone()
 
-    # Rotate K
-    k_even = k_rot_part[..., 0::2]  # (B, T, Hk, rotary_dim/2)
-    k_odd = k_rot_part[..., 1::2]
-
-    k_rotated = torch.stack(
-        (k_even * cos - k_odd * sin,
-         k_even * sin + k_odd * cos),
-        dim=-1
-    ).flatten(-2)  # (B, T, Hk, rotary_dim)
-
-    # Concatenate back non-rotary dims
-    q_out = torch.cat((q_rotated, q_pass), dim=-1)  # (B, T, Hq, D)
-    k_out = torch.cat((k_rotated, k_pass), dim=-1)  # (B, T, Hk, D)
-
-    return q_out, k_out
+    # Apply 2-D rotation matrix to each (even, odd) pair:
+    #   [ cos  -sin ] [ x_even ]
+    #   [ sin   cos ] [ x_odd  ]
+    x_rot[..., 0::2] = x_even * cos - x_odd * sin
+    x_rot[..., 1::2] = x_even * sin + x_odd * cos
+    # x[..., rotary_dim:] is untouched — no copy needed
