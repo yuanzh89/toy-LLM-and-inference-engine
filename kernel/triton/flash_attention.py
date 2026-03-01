@@ -203,6 +203,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.
         SEQ_LEN=seq_len,
         BLOCK_D=D,
     )
+
     return out
 
 

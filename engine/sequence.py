@@ -1,9 +1,9 @@
+import math
 from copy import copy
 from enum import IntEnum
 from itertools import count
 
 from kv_cache_block import Block
-import math
 
 
 class SequenceStatus(IntEnum):
@@ -22,6 +22,7 @@ class SequenceStatus(IntEnum):
     FINISHED = 1
     RUNNING = 2
     WAITING = 3
+    FAILED = 4
 
 
 class Sequence:
@@ -57,10 +58,10 @@ class Sequence:
     counter = count()
 
     def __init__(
-        self,
-        token_ids: list[int],
-        max_token_size_per_kv_cache_block: int,
-        max_sequence_length: int,
+            self,
+            token_ids: list[int],
+            max_token_size_per_kv_cache_block: int,
+            max_sequence_length: int,
     ):
         self.seq_id: int = next(Sequence.counter)
         self.status: SequenceStatus = SequenceStatus.WAITING
@@ -69,8 +70,13 @@ class Sequence:
         self.max_token_size_per_kv_cache_block = max_token_size_per_kv_cache_block
         self.max_sequence_length = max_sequence_length
         # Populated by BlockManager via update_kv_cache_blocks().
+        # Blocks are sorted by their order in the Trie tree, so that the previous block should be the parent of the next block in prefix caching Trie tree.
         self.kv_cache_blocks: list["Block | None"] = []
         self.kv_cache_blocks_initialized: bool = False
+        # Activations of the sequence in the current state.
+        # Activations should be initialized by the tokenizer, then updated sequentially by the embedding layer, multiple transformer blocks and finally the LM head layer.
+        # [batch_size, seq_len, d_model]
+        self.activations = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -116,7 +122,7 @@ class Sequence:
         """
         chunks = []
         for i in range(0, len(self.token_ids), self.max_token_size_per_kv_cache_block):
-            chunks.append(self.token_ids[i : i + self.max_token_size_per_kv_cache_block])
+            chunks.append(self.token_ids[i: i + self.max_token_size_per_kv_cache_block])
         return chunks
 
     # ------------------------------------------------------------------

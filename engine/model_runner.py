@@ -3,6 +3,7 @@ from multiprocessing import Queue
 
 from block_manager import BlockManager
 from config import ToyLLMConfig
+from engine.sequence import SequenceStatus
 from layer.toy_llm_model import ToyLLMModel
 from sequence import Sequence
 
@@ -43,6 +44,28 @@ class ToyLLMModelRunner:
 
             # Run prefill for sequence
             pass
+
+    def prefill_sequence(self, seq: Sequence):
+        """
+        This function is responsible for prefilling a sequence, update sequence status and populate its KV cache.
+        """
+
+        if not self.block_manager.allocate_blocks(seq):
+            # block manager currently doesn't have enough KV cache blocks to serve this sequence
+            # We could either:
+            #  1. Put this sequence back to the end of the queue for a retry later, with a max_retry count.
+            #  2. Drop this sequence and return failure.
+            # In this demo code, for simplicity, we could just drop the sequence.
+            seq.status = SequenceStatus.FAILED
+            seq.release()  # Release resources related the resources allocated for this sequence
+            return
+
+        # At this point, the KV cache blocks are properly allocated for the input sequence and reference are built between these resources.
+        seq.status = SequenceStatus.RUNNING
+        # TODO: Double check the correctness here.
+        self.model.prefill(seq)
+
+        return
 
     def run_in_decode_mode(self):
         """

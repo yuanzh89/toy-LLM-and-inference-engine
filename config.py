@@ -18,6 +18,10 @@ class ToyLLMConfig:
     max_token_size_per_kv_cache_block: int
     max_sequence_length: int
 
+    # Prefill config
+    # Chunk size of Query for chunked prefill
+    query_chunk_size: int
+
     # Decode config
     decode_max_batch_size: int
 
