@@ -2,19 +2,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from engine.sequence import Sequence
+
 
 class SwiGLUFFNLayer(nn.Module):
-    def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
 
         self.rms_norm = nn.RMSNorm(d_model, eps=1e-6)
 
-        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
-        self.w2 = nn.Linear(d_model, hidden_dim, bias=False)
-        self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
+        self.d_model = d_model
+        self.dff = d_ff
+
+        self.w1 = nn.Linear(d_model, d_ff, bias=False)
+        self.w2 = nn.Linear(d_model, d_ff, bias=False)
+        self.w3 = nn.Linear(d_ff, d_model, bias=False)
+
         self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, seq: Sequence) -> None:
+        x = seq.get_full_activations()
+
         residual = x
 
         x = self.rms_norm(x)
@@ -25,17 +33,20 @@ class SwiGLUFFNLayer(nn.Module):
 
         output = self.dropout(output)
 
-        return output + residual
+        seq.activations = output + residual
 
 
 class FusedSwiGLUFFNLayer(nn.Module):
-    def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
+
+        self.d_model = d_model
+        self.dff = d_ff
 
         self.rms_norm = nn.RMSNorm(d_model, eps=1e-6)
 
-        self.w12 = nn.Linear(d_model, hidden_dim * 2, bias=False)
-        self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
+        self.w12 = nn.Linear(d_model, d_ff * 2, bias=False)
+        self.w3 = nn.Linear(d_ff, d_model, bias=False)
         self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -44,7 +55,7 @@ class FusedSwiGLUFFNLayer(nn.Module):
         x = self.rms_norm(x)
 
         x12 = self.w12(x)
-        x1, x2 = x12.split(self.hidden_dim, dim=-1)
+        x1, x2 = x12.split(self.d_ff, dim=-1)
 
         out = x1 * F.silu(x2)
         out = self.w3(out)

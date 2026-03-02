@@ -3,6 +3,8 @@ from copy import copy
 from enum import IntEnum
 from itertools import count
 
+import torch
+
 from kv_cache_block import Block
 
 
@@ -62,6 +64,7 @@ class Sequence:
             token_ids: list[int],
             max_token_size_per_kv_cache_block: int,
             max_sequence_length: int,
+            query_chunk_size: int,
     ):
         self.seq_id: int = next(Sequence.counter)
         self.status: SequenceStatus = SequenceStatus.WAITING
@@ -69,6 +72,9 @@ class Sequence:
         self.num_prompt_tokens: int = len(token_ids)
         self.max_token_size_per_kv_cache_block = max_token_size_per_kv_cache_block
         self.max_sequence_length = max_sequence_length
+        self.query_chunk_size = query_chunk_size
+        self._num_query_chunks = math.ceil(len(token_ids) / self.query_chunk_size)
+
         # Populated by BlockManager via update_kv_cache_blocks().
         # Blocks are sorted by their order in the Trie tree, so that the previous block should be the parent of the next block in prefix caching Trie tree.
         self.kv_cache_blocks: list["Block | None"] = []
@@ -76,7 +82,7 @@ class Sequence:
         # Activations of the sequence in the current state.
         # Activations should be initialized by the tokenizer, then updated sequentially by the embedding layer, multiple transformer blocks and finally the LM head layer.
         # [batch_size, seq_len, d_model]
-        self.activations = None
+        self.chunked_activations = [None] * self._num_query_chunks
 
     # ------------------------------------------------------------------
     # Properties
@@ -90,6 +96,17 @@ class Sequence:
     def __len__(self) -> int:
         """Total number of tokens in this sequence (prompt + generated)."""
         return len(self.token_ids)
+
+    def get_query_chunk_activations(self, query_chunk_idx: int) -> torch.tensor | None:
+        assert 0 <= query_chunk_idx < self._num_query_chunks
+        return self.chunked_activations[query_chunk_idx]
+
+    def get_full_activations(self) -> torch.Tensor | None:
+        return torch.cat(self.chunked_activations, dim=1)
+
+    def get_last_token_activations(self) -> torch.Tensor:
+        # [batch_size, 1, d_model]
+        return self.activations[-1][:, -1, :]
 
     # ------------------------------------------------------------------
     # Token management

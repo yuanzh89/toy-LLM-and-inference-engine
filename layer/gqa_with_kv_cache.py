@@ -101,9 +101,9 @@ class GQAWithKVCache(nn.Module):
 
         self.o_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(dropout)
 
-    def forward(self, seq: Sequence, is_causal: bool = True) -> None:
-        # x: [batch_size, seq_len, d_model]
-        x = seq.activations
+    def forward(self, seq: Sequence, query_chunk_idx: int) -> None:
+        # x: [batch_size, seq_len, d_model] per query chunk for Chunked Prefill
+        x = seq.get_query_chunk_activations(query_chunk_idx)
         batch_size, seq_len, d_model = x.shape
         residual = x
 
@@ -193,16 +193,8 @@ class GQAWithKVCache(nn.Module):
         # Q positions always start at 0 for the full sequence.
         apply_rope(q, self.head_dim, start_pos=0)
 
-        q_chunks = torch.split(q, self.llm_config.query_chunk_size, dim=2)
-        # Each chunk: [B, num_query_heads, chunk_size, head_dim]
-
-        output_chunks = []
-        for q_chunk in q_chunks:
-            # flash_attention expects contiguous tensors.
-            o_chunk = flash_attention(q_chunk.contiguous(), k_full, v_full)
-            output_chunks.append(o_chunk)
-
-        o = torch.cat(output_chunks, dim=2)  # [B, num_query_heads, seq_len, head_dim]
+        # flash_attention expects contiguous tensors.
+        o = flash_attention(q.contiguous(), k_full, v_full)
 
         # Merge heads back → [B, seq_len, d_model]
         o = o.transpose(1, 2).reshape(batch_size, seq_len, d_model)
