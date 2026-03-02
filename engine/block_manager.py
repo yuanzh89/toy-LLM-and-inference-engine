@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from itertools import count
 
 from kv_cache_block import Block
@@ -14,7 +16,7 @@ class BlockManager:
 
     1. **Prefix lookup** – walk the :class:`~prefix_caching.BlockTrieTree` to find
        blocks whose KV tensors have already been computed for a matching token prefix,
-       allowing those layers to skip recomputation.
+       allowing the attention layers to skip recomputation.
     2. **Block allocation** – allocate new :class:`~kv_cache_block.Block` objects for
        the portions of a sequence that are not already cached.
     3. **Eviction** – when the pool is full, free blocks whose ``ref_count`` is zero
@@ -24,39 +26,34 @@ class BlockManager:
     ------------------
     **Step 1** – After the embedding layer we have a sequence with prompt token IDs.
 
-    **Step 2** – Before the transformer layers, split the sequence into fixed-size
-    chunks::
+    **Step 2** – Before the transformer layers, attempt allocation::
 
-        token_ids_chunks = seq.token_ids_in_chunks()
-
-    **Step 3** – Attempt allocation (prefix match + new block creation)::
-
-        success = block_manager.allocate_blocks(layer_id, seq)
+        success = block_manager.allocate_blocks(seq)
         # Returns False if the pool is exhausted and eviction cannot free enough blocks.
 
     Suppose the sequence needs 4 blocks and the trie yields 2 prefix hits (b1, b2).
     ``allocate_blocks`` will attempt to evict old blocks to make room and then
     allocate b3 and b4.
 
-    **Step 4** – In each attention layer, read cached blocks::
+    **Step 3** – In each attention layer, read cached blocks::
 
         k1, v1 = b1.read_kv_cache(layer_id)
         k2, v2 = b2.read_kv_cache(layer_id)
 
     Because ``b3.is_empty(layer_id)`` and ``b4.is_empty(layer_id)`` are ``True``,
-    compute their KV tensors on-the-fly, apply RoPE, and write them back::
+    compute their KV tensors on-the-fly and write them back::
 
         b3.prefill_write_kv_cache(layer_id, k3, v3)
         b4.prefill_write_kv_cache(layer_id, k4, v4)
 
-    Concatenate to form the full K and V matrices for the attention operation::
+    Then concatenate to form the full K/V matrices::
 
-        K = concat([k1, k2, k3, k4], dim=seq_len)
-        V = concat([v1, v2, v3, v4], dim=seq_len)
+        K = concat([k1, k2, k3, k4], dim=2)  # dim=2 is the seq_len axis
+        V = concat([v1, v2, v3, v4], dim=2)
 
-    **Step 5** – During decode, each new token's KV slice is appended::
+    **Step 4** – During decode, each new token's KV slice is appended::
 
-        b4.decode_append_kv_cache(layer_id, k_new, v_new)
+        b4.decode_append_token_ids_and_kv_cache(layer_id, [new_token_id], k_new, v_new)
 
     Attributes
     ----------
@@ -108,7 +105,7 @@ class BlockManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def allocate_blocks(self, layer_id: int, seq: Sequence) -> bool:
+    def allocate_blocks(self, seq: Sequence) -> bool:
         """
         Perform prefix lookup and allocate KV-cache blocks for *seq*.
 
@@ -127,9 +124,6 @@ class BlockManager:
 
         Parameters
         ----------
-        layer_id : int
-            The transformer layer index for which this allocation is being performed
-            (currently unused in the allocation logic but kept for API symmetry).
         seq : Sequence
             The sequence that needs KV-cache blocks.
 
@@ -151,16 +145,14 @@ class BlockManager:
             if chunk_key not in trie_node.children:
                 break
             trie_node = trie_node.children[chunk_key]
-            # Pin the hit block so it is not evicted while we are still using it.
+            # Pin the hit block so it is not evicted while we are building the list.
             trie_node.block.inc_ref_count()
             blocks.append(trie_node.block)
 
         # --- Step 2 & 3: Make room for the blocks we still need ---
         needed_kv_cache_blocks = num_chunks - len(blocks)
         if not self.evict_blocks(needed_kv_cache_blocks):
-            # Could not free enough blocks; undo any reference count increments
-            # BUG FIX: original called block.remove_reference(seq) which does not
-            # exist on Block.  The correct method is dec_ref_count().
+            # Could not free enough space; undo any reference count increments.
             for block in blocks:
                 block.dec_ref_count()
             return False
@@ -186,7 +178,7 @@ class BlockManager:
 
     def evict_blocks(self, needed_kv_cache_blocks: int) -> bool:
         """
-        Evict up to *needed_kv_cache_blocks* blocks from the pool to make room.
+        Evict up to *needed_kv_cache_blocks* unreferenced blocks from the pool.
 
         Only blocks with ``ref_count == 0`` (i.e. not referenced by any active
         sequence) are eligible for eviction.  Among eligible blocks, those with the
@@ -199,7 +191,8 @@ class BlockManager:
         Parameters
         ----------
         needed_kv_cache_blocks : int
-            Number of free block slots required.  If zero, returns ``True`` immediately.
+            Number of free block slots required.  If zero or negative, returns
+            ``True`` immediately.
 
         Returns
         -------
@@ -210,21 +203,13 @@ class BlockManager:
         if needed_kv_cache_blocks <= 0:
             return True
 
-        # Sort so that the best eviction candidate (lowest ref_count, then deepest)
-        # ends up at the tail; we pop from the tail for O(1) removal.
+        # Sort so the best eviction candidate (ref_count == 0, deepest trie depth)
+        # ends up at the tail; pop from the tail for O(1) removal.
         self.blocks.sort(reverse=True)
 
         while needed_kv_cache_blocks > 0 and self.blocks and self.blocks[-1].ref_count == 0:
             block_to_evict = self.blocks.pop()
-
-            # BUG FIX: the original code retrieved `parent` but never called
-            # `remove_child`, leaving stale nodes in the trie that could be matched
-            # by future prefix lookups.  We must detach the evicted node here.
-            parent = block_to_evict.trie_node.parent if hasattr(block_to_evict, 'trie_node') else None
-            # Detach from trie via the parent stored on the trie node.
-            # We locate the node by walking the trie using the block's own token_ids.
             self._remove_block_from_trie(block_to_evict)
-
             needed_kv_cache_blocks -= 1
 
         return needed_kv_cache_blocks == 0
@@ -233,43 +218,31 @@ class BlockManager:
         """
         Remove the trie node associated with *block* from the prefix-caching trie.
 
-        Walks from the trie root using the block's token IDs to locate the node,
-        then calls ``remove_child`` on the parent.  If the node cannot be found
-        (e.g. the block was never inserted into the trie), the method is a no-op.
+        Uses the ``trie_node`` back-reference stored on the block for O(1) removal.
+        If the block has no trie node (e.g. it was never inserted), the method is a
+        no-op.
 
         Parameters
         ----------
         block : Block
             The block whose corresponding trie node should be detached.
         """
-        # Locate the parent node by walking down to one level above the block's node.
-        parent_node = self.block_trie_tree.root
-        key = tuple(block.token_ids)
+        node = block.trie_node
+        if node is None or node.parent is None:
+            # Block was never inserted into the trie, or it is the root (impossible
+            # in practice, but guard defensively).
+            return
 
-        # Navigate via the root; for partial (last-chunk) blocks we cannot simply
-        # use block.token_ids as a single-level key — the block sits at some depth.
-        # We use the block's trie_tree_depth to know how deep to look and rely on
-        # the trie structure. A simpler approach: store a back-reference to the node.
-        # For now we do a best-effort single-level remove from whichever parent holds it.
-        # In a production implementation, Block should store a direct reference to its
-        # BlockTrieNode to make this O(1).
-        for child_node in parent_node.children.values():
-            if child_node.block is block:
-                parent_node.remove_child(key)
-                return
-            # Recurse one level (sufficient for the common eviction case where the
-            # evicted block is a leaf or near-leaf node).
-            for grandchild_node in child_node.children.values():
-                if grandchild_node.block is block:
-                    child_node.remove_child(tuple(grandchild_node.token_ids))
-                    return
+        parent = node.parent
+        parent.remove_child(node.key())
+        block.trie_node = None
 
     # ------------------------------------------------------------------
     # Allocation
     # ------------------------------------------------------------------
 
     def allocate_block(
-            self, token_ids: list[int], parent_trie_node: "BlockTrieNode | None"
+            self, token_ids: list[int], parent_trie_node: BlockTrieNode | None
     ) -> Block:
         """
         Create a new, empty KV-cache block and register it in the trie.
@@ -278,7 +251,8 @@ class BlockManager:
         sufficient space in the pool.  It does **not** check pool capacity itself.
 
         The new block's ``trie_tree_depth`` is set to one greater than its parent's
-        depth (or 1 if there is no parent), so that eviction ordering is correct.
+        depth (or 1 if the parent is the virtual root), so that eviction ordering
+        is correct.
 
         Parameters
         ----------
@@ -299,9 +273,12 @@ class BlockManager:
         self.blocks.append(block)
 
         if parent_trie_node is not None:
-            parent_trie_node.add_child(token_ids, block)
+            # Register the new block in the trie and store the back-reference.
+            trie_node = parent_trie_node.add_child(token_ids, block)
+            block.trie_node = trie_node
+
             if parent_trie_node.block is None:
-                # parent is the virtual root
+                # Parent is the virtual root; this block sits at depth 1.
                 block.trie_tree_depth = 1
             else:
                 block.trie_tree_depth = parent_trie_node.block.trie_tree_depth + 1

@@ -1,8 +1,11 @@
-from copy import copy
-from itertools import count
+from __future__ import annotations
 
-from kv_cache_block import Block
-from sequence import Sequence
+from copy import copy
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from kv_cache_block import Block
+    from sequence import Sequence
 
 
 class BlockTrieNode:
@@ -10,9 +13,9 @@ class BlockTrieNode:
     A single node in the :class:`BlockTrieTree`.
 
     Each node represents one KV-cache block's worth of token IDs and holds a
-    reference to the corresponding :class:`Block`.  The children dict maps a
-    ``tuple[int, ...]`` of token IDs to the next ``BlockTrieNode`` in the trie,
-    enabling O(depth) prefix lookups.
+    reference to the corresponding :class:`Block`.  The ``children`` dict maps a
+    ``tuple[int, ...]`` of token IDs to the next :class:`BlockTrieNode` in the
+    trie, enabling O(depth) prefix lookups.
 
     Attributes
     ----------
@@ -28,15 +31,15 @@ class BlockTrieNode:
     """
 
     def __init__(
-        self,
-        token_ids: list[int],
-        block: "Block | None",
-        parent: "BlockTrieNode | None" = None,
+            self,
+            token_ids: list[int],
+            block: Block | None,
+            parent: BlockTrieNode | None = None,
     ):
         self.token_ids: list[int] = copy(token_ids)
         self.block = block
         self.parent = parent
-        self.children: dict[tuple[int, ...], "BlockTrieNode"] = {}
+        self.children: dict[tuple[int, ...], BlockTrieNode] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -59,7 +62,7 @@ class BlockTrieNode:
     # Child management
     # ------------------------------------------------------------------
 
-    def add_child(self, token_ids: list[int], block: "Block") -> "BlockTrieNode":
+    def add_child(self, token_ids: list[int], block: Block) -> BlockTrieNode:
         """
         Insert a child node for the given token IDs if one does not already exist.
 
@@ -99,8 +102,7 @@ class BlockTrieNode:
         block_key : tuple[int, ...]
             The token-ID tuple that was used as the key when the child was added.
         """
-        if block_key in self.children:
-            self.children.pop(block_key)
+        self.children.pop(block_key, None)
 
 
 class BlockTrieTree:
@@ -120,6 +122,7 @@ class BlockTrieTree:
     """
 
     def __init__(self):
+        # The root is a sentinel with no token IDs and no associated block.
         self.root: BlockTrieNode = BlockTrieNode([], None)
 
     def lookup_blocks(self, seq: Sequence) -> list[Block]:
@@ -140,7 +143,7 @@ class BlockTrieTree:
         -------
         list[Block]
             Ordered list of :class:`Block` objects corresponding to the matched
-            prefix chunks.  The list length is between 0 and
+            prefix chunks.  Length is between 0 and
             ``len(seq.token_ids_in_chunks())``.
         """
         blocks: list[Block] = []

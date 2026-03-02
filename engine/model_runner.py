@@ -1,83 +1,126 @@
+from __future__ import annotations
+
 import queue
 from multiprocessing import Queue
 
 from block_manager import BlockManager
 from config import ToyLLMConfig
-from engine.sequence import SequenceStatus
+from sequence import Sequence, SequenceStatus
 from layer.toy_llm_model import ToyLLMModel
-from sequence import Sequence
 
-
-# class ModelRunMode(Enum):
-#     PREFILL = auto()
-#     DECODE = auto()
 
 class ToyLLMModelRunner:
     """
-    This class wrap a model and its config, and provide an API to run the model in prefill or decode mode.
+    Wraps a :class:`~toy_llm_model.ToyLLMModel` and its configuration, providing
+    high-level entry points for running the model in **prefill** or **decode** mode.
+
+    The runner owns a single :class:`~block_manager.BlockManager` shared between
+    the model and the scheduling loop.  It reads incoming :class:`~sequence.Sequence`
+    objects from a :class:`~multiprocessing.Queue` and drives the model forward.
+
+    Prefill mode
+    ------------
+    The model computes KV caches from scratch (or from cached prefixes) and
+    populates the block manager.  Each call to ``prefill_sequence`` processes one
+    sequence end-to-end.
+
+    Decode mode
+    -----------
+    The model reads KV caches that were populated during prefill (potentially on a
+    different node in a disaggregated setup) and generates one token per step.
+    Sequences are batched up to ``llm_config.decode_max_batch_size``.
+
+    Attributes
+    ----------
+    llm_config : ToyLLMConfig
+        Unified model/inference configuration.
+    queue : Queue
+        Inter-process queue delivering :class:`~sequence.Sequence` objects (or the
+        sentinel ``ToyLLMModelRunner.SENTINEL`` to signal shutdown).
+    model : ToyLLMModel
+        The underlying language model.
+    block_manager : BlockManager
+        Manages the pool of paged KV-cache blocks.
     """
+
     SENTINEL = object()
 
     def __init__(self, llm_config: ToyLLMConfig, queue: Queue):
         self.llm_config = llm_config
-        # The queue to receive incoming prefill / decode sequences
         self.queue = queue
 
-        self.model = ToyLLMModel(llm_config.vocab_size, llm_config.d_model, llm_config.num_query_heads,
-                                 llm_config.num_kv_heads,
-                                 llm_config.d_ff, llm_config.num_transformer_layers, llm_config.dropout)
+        self.block_manager = BlockManager(
+            llm_config.max_block_size,
+            llm_config.max_token_size_per_kv_cache_block,
+            llm_config.num_transformer_layers,
+        )
+        self.model = ToyLLMModel(llm_config, self.block_manager)
 
-        self.block_manager = BlockManager(llm_config.max_block_size, llm_config.max_token_size_per_kv_cache_block,
-                                          llm_config.num_transformer_layers)
+    # ------------------------------------------------------------------
+    # Prefill
+    # ------------------------------------------------------------------
 
-    def run_in_prefill_mode(self):
+    def run_in_prefill_mode(self) -> None:
         """
-        This function is the entry point to run the model in prefill mode.
+        Entry point for the prefill worker loop.
 
-        When the model is running in prefill mode.
-        The model computes and writes KV caches via block manager.
+        Continuously pops sequences from the queue, runs ``prefill_sequence`` on
+        each, and exits when :attr:`SENTINEL` is received.
         """
         while True:
             sequence = self.queue.get()
             if sequence is ToyLLMModelRunner.SENTINEL:
                 break
+            self.prefill_sequence(sequence)
 
-            # Run prefill for sequence
-            pass
-
-    def prefill_sequence(self, seq: Sequence):
+    def prefill_sequence(self, seq: Sequence) -> None:
         """
-        This function is responsible for prefilling a sequence, update sequence status and populate its KV cache.
+        Allocate KV-cache blocks and run the prefill forward pass for *seq*.
+
+        If the block manager cannot allocate enough blocks (pool exhausted), the
+        sequence is marked :attr:`~sequence.SequenceStatus.FAILED` and released.
+        Otherwise the model is run to populate the KV cache and generate the first
+        token, and the sequence status is set to
+        :attr:`~sequence.SequenceStatus.RUNNING`.
+
+        Parameters
+        ----------
+        seq : Sequence
+            The sequence to prefill.  Token IDs must already be populated.
         """
 
         if not self.block_manager.allocate_blocks(seq):
-            # block manager currently doesn't have enough KV cache blocks to serve this sequence
-            # We could either:
-            #  1. Put this sequence back to the end of the queue for a retry later, with a max_retry count.
-            #  2. Drop this sequence and return failure.
-            # In this demo code, for simplicity, we could just drop the sequence.
+            # Not enough KV-cache space — drop the sequence rather than retry.
             seq.status = SequenceStatus.FAILED
-            seq.release()  # Release resources related the resources allocated for this sequence
+            seq.release()
             return
 
-        # At this point, the KV cache blocks are properly allocated for the input sequence and reference are built between these resources.
         seq.status = SequenceStatus.RUNNING
-        # TODO: Double check the correctness here.
-        self.model.prefill(seq)
 
-        return
+        # Run the prefill forward pass one query chunk at a time.
+        token_ids_in_chunks = seq.token_ids_in_chunks()
+        for query_chunk_idx in range(len(token_ids_in_chunks)):
+            self.model(seq, query_chunk_idx)
 
-    def run_in_decode_mode(self):
+    # ------------------------------------------------------------------
+    # Decode
+    # ------------------------------------------------------------------
+
+    def run_in_decode_mode(self) -> None:
         """
-        This function is the entry point to run the model in decode mode.
+        Entry point for the decode worker loop.
 
-        When the model reads KV caches via block manager.
-        Assuming KV cache is already transferred from prefill node to decode node and properly populated in block manager.
+        Batches up to ``llm_config.decode_max_batch_size`` sequences from the
+        queue per step and runs a batched decode pass.  Exits when
+        :attr:`SENTINEL` is received.
+
+        Note: KV caches are assumed to have been transferred from the prefill
+        node and already populated in the block manager before this loop starts.
         """
         while True:
             batch: list[Sequence] = []
-
             stop_listening = False
+
             for _ in range(self.llm_config.decode_max_batch_size):
                 try:
                     sequence = self.queue.get_nowait()
@@ -89,8 +132,11 @@ class ToyLLMModelRunner:
                     break
 
             if batch:
-                # Run batched decode
-                pass
+                # Run one decode step for the entire batch.
+                # Each sequence gets exactly one new token appended.
+                for seq in batch:
+                    # During decode there is only one chunk (the new token).
+                    self.model(seq, query_chunk_idx=0)
 
             if stop_listening:
                 break

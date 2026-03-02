@@ -1,11 +1,15 @@
+from __future__ import annotations
+
 import math
 from copy import copy
 from enum import IntEnum
 from itertools import count
+from typing import TYPE_CHECKING
 
 import torch
 
-from kv_cache_block import Block
+if TYPE_CHECKING:
+    from kv_cache_block import Block
 
 
 class SequenceStatus(IntEnum):
@@ -20,6 +24,8 @@ class SequenceStatus(IntEnum):
         The sequence is actively being processed (prefill or decode step in progress).
     WAITING : int
         The sequence is queued and waiting for KV-cache blocks to be allocated.
+    FAILED : int
+        Allocation or processing failed; the sequence has been dropped.
     """
     FINISHED = 1
     RUNNING = 2
@@ -31,9 +37,16 @@ class Sequence:
     """
     Represents a single request/sequence being processed by the inference engine.
 
-    A :class:`Sequence` owns a reference to a contiguous list of token IDs that
-    grows during decoding.  It also tracks which physical KV-cache
-    :class:`~kv_cache_block.Block` objects hold its cached key/value tensors.
+    A :class:`Sequence` owns a contiguous list of token IDs that grows during
+    decoding.  It also tracks which physical KV-cache :class:`~kv_cache_block.Block`
+    objects hold its cached key/value tensors.
+
+    Chunked processing
+    ------------------
+    The token IDs are partitioned into fixed-size *query chunks* (each of length
+    ``query_chunk_size``) for the attention layers.  Intermediate activations are
+    stored in ``chunked_activations`` — one tensor per chunk — so that different
+    chunks can be computed independently during chunked prefill.
 
     Attributes
     ----------
@@ -46,9 +59,15 @@ class Sequence:
     num_prompt_tokens : int
         Number of tokens in the original prompt (fixed after construction).
     max_token_size_per_kv_cache_block : int
-        Block granularity; used when splitting token IDs into chunks.
+        Block granularity; used when splitting token IDs into KV-cache chunks.
     max_sequence_length : int
         Hard cap on the total number of tokens (prompt + decode).
+    query_chunk_size : int
+        Number of tokens processed per attention query chunk.
+    chunked_activations : list[torch.Tensor | None]
+        Intermediate hidden-state tensors, one per query chunk.
+        Shape of each entry: ``[batch_size, chunk_seq_len, d_model]``.
+        Populated by the embedding layer and updated by each transformer block.
     kv_cache_blocks : list[Block | None]
         Ordered list of KV-cache blocks aligned with ``token_ids_in_chunks()``.
         Populated by :class:`~block_manager.BlockManager`; entries may be ``None``
@@ -75,14 +94,13 @@ class Sequence:
         self.query_chunk_size = query_chunk_size
         self._num_query_chunks = math.ceil(len(token_ids) / self.query_chunk_size)
 
-        # Populated by BlockManager via update_kv_cache_blocks().
-        # Blocks are sorted by their order in the Trie tree, so that the previous block should be the parent of the next block in prefix caching Trie tree.
-        self.kv_cache_blocks: list["Block | None"] = []
+        # One activation tensor per query chunk; filled by the embedding layer and
+        # updated in-place by each transformer block.  Shape: [B, chunk_len, d_model].
+        self.chunked_activations: list[torch.Tensor | None] = [None] * self._num_query_chunks
+
+        # Populated by BlockManager; one block per KV-cache chunk.
+        self.kv_cache_blocks: list[Block | None] = []
         self.kv_cache_blocks_initialized: bool = False
-        # Activations of the sequence in the current state.
-        # Activations should be initialized by the tokenizer, then updated sequentially by the embedding layer, multiple transformer blocks and finally the LM head layer.
-        # [batch_size, seq_len, d_model]
-        self.chunked_activations = [None] * self._num_query_chunks
 
     # ------------------------------------------------------------------
     # Properties
@@ -97,16 +115,61 @@ class Sequence:
         """Total number of tokens in this sequence (prompt + generated)."""
         return len(self.token_ids)
 
-    def get_query_chunk_activations(self, query_chunk_idx: int) -> torch.tensor | None:
+    # ------------------------------------------------------------------
+    # Activation helpers
+    # ------------------------------------------------------------------
+
+    def get_query_chunk_activations(self, query_chunk_idx: int) -> torch.Tensor | None:
+        """
+        Return the activation tensor for *query_chunk_idx*.
+
+        Parameters
+        ----------
+        query_chunk_idx : int
+            Zero-based index into ``chunked_activations``.
+
+        Returns
+        -------
+        torch.Tensor | None
+            The activation tensor for the requested chunk, or ``None`` if the
+            embedding layer has not yet been run for that chunk.
+        """
         assert 0 <= query_chunk_idx < self._num_query_chunks
         return self.chunked_activations[query_chunk_idx]
 
-    def get_full_activations(self) -> torch.Tensor | None:
+    def get_full_activations(self) -> torch.Tensor:
+        """
+        Concatenate all query-chunk activation tensors along the sequence dimension.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``[batch_size, total_seq_len, d_model]``.
+
+        Raises
+        ------
+        ValueError
+            If any chunk activation is still ``None`` (embedding not yet run).
+        """
+        if any(a is None for a in self.chunked_activations):
+            raise ValueError(
+                "Not all chunked_activations have been populated; "
+                "call the embedding layer before get_full_activations()."
+            )
         return torch.cat(self.chunked_activations, dim=1)
 
     def get_last_token_activations(self) -> torch.Tensor:
-        # [batch_size, 1, d_model]
-        return self.activations[-1][:, -1, :]
+        """
+        Return the hidden state of the very last token across all chunks.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``[batch_size, 1, d_model]``.
+        """
+        last_chunk = self.chunked_activations[-1]
+        assert last_chunk is not None, "Last chunk activations have not been computed yet."
+        return last_chunk[:, -1:, :]   # [batch_size, 1, d_model]
 
     # ------------------------------------------------------------------
     # Token management
@@ -134,13 +197,13 @@ class Sequence:
         Returns
         -------
         list[list[int]]
-            Ordered list of token-ID chunks.  The concatenation of all chunks
-            equals ``self.token_ids``.
+            Ordered list of token-ID chunks whose concatenation equals
+            ``self.token_ids``.
         """
-        chunks = []
-        for i in range(0, len(self.token_ids), self.max_token_size_per_kv_cache_block):
-            chunks.append(self.token_ids[i: i + self.max_token_size_per_kv_cache_block])
-        return chunks
+        return [
+            self.token_ids[i: i + self.max_token_size_per_kv_cache_block]
+            for i in range(0, len(self.token_ids), self.max_token_size_per_kv_cache_block)
+        ]
 
     # ------------------------------------------------------------------
     # KV-cache block management
@@ -163,7 +226,7 @@ class Sequence:
         self.kv_cache_blocks = [None] * num_chunks
         self.kv_cache_blocks_initialized = False
 
-    def update_kv_cache_blocks(self, kv_cache_blocks: list["Block"]) -> None:
+    def update_kv_cache_blocks(self, kv_cache_blocks: list[Block]) -> None:
         """
         Replace the KV-cache block list with the fully resolved set of blocks.
 
@@ -175,6 +238,8 @@ class Sequence:
         ----------
         kv_cache_blocks : list[Block]
             Ordered list of :class:`~kv_cache_block.Block` objects; one per chunk.
+            Order must match the order of ``token_ids_in_chunks()`` so that block
+            ``i`` holds the KV cache for chunk ``i``.
         """
         expected = math.ceil(len(self.token_ids) / self.max_token_size_per_kv_cache_block)
         assert len(kv_cache_blocks) == expected, (
@@ -187,12 +252,13 @@ class Sequence:
 
     def release(self) -> None:
         """
-        Explicitly release all KV-cache block references.
-        Must be called by the scheduler.
+        Release all KV-cache block references held by this sequence.
 
         Decrements the ``ref_count`` of every non-``None`` block so that the
         :class:`~block_manager.BlockManager` knows these blocks are no longer
         pinned and may be eligible for eviction.
+
+        Must be called by the scheduler when the sequence finishes or is dropped.
         """
         for block in self.kv_cache_blocks:
             if block is not None:

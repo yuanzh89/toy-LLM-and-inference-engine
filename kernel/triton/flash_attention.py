@@ -127,7 +127,7 @@ def _flash_attention_fwd_kernel(
         # Q @ K^T  →  [BLOCK_M, BLOCK_N]
         qk = tl.dot(q, k_T)
 
-        # ---- Apply ALL masks BEFORE scaling (bug fix) ---------------
+        # ---- Apply ALL masks BEFORE scaling -------------------------
         # Causal mask: query position must be >= key position
         causal_mask = offs_m[:, None] >= cols[None, :]
         qk = tl.where(causal_mask, qk, NEG_INF)
