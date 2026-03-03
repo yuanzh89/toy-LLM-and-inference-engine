@@ -110,7 +110,7 @@ class Block:
 
     def can_append(self) -> bool:
         """Return ``True`` if this block is in decode-only mode (not yet in the trie)."""
-        return self.trie_tree_depth == 0 and
+        return self.trie_tree_depth == 0
 
     # ------------------------------------------------------------------
     # Reference counting

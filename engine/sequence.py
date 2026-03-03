@@ -34,6 +34,7 @@ class SequenceStatus(IntEnum):
     PREFILL_PENDING = 3
     DECODE_PENDING = 4
     FINISHED = 5
+    FAILED = 6
 
 class Sequence:
     """

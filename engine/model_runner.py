@@ -5,8 +5,8 @@ from multiprocessing import Queue
 
 from block_manager import BlockManager
 from config import ToyLLMConfig
-from sequence import Sequence, SequenceStatus
 from layer.toy_llm_model import ToyLLMModel
+from sequence import Sequence, SequenceStatus
 
 
 class ToyLLMModelRunner:
@@ -95,12 +95,12 @@ class ToyLLMModelRunner:
             seq.release()
             return
 
-        seq.status = SequenceStatus.RUNNING
+        seq.status = SequenceStatus.PREFILL_PENDING
 
         # Run the prefill forward pass one query chunk at a time.
         token_ids_in_chunks = seq.token_ids_in_chunks()
         for query_chunk_idx in range(len(token_ids_in_chunks)):
-            self.model(seq, query_chunk_idx)
+            self.model([seq], [query_chunk_idx], is_prefill=True)
 
     # ------------------------------------------------------------------
     # Decode
@@ -134,9 +134,7 @@ class ToyLLMModelRunner:
             if batch:
                 # Run one decode step for the entire batch.
                 # Each sequence gets exactly one new token appended.
-                for seq in batch:
-                    # During decode there is only one chunk (the new token).
-                    self.model(seq, query_chunk_idx=0)
+                self.model(batch, is_prefill=False)
 
             if stop_listening:
                 break

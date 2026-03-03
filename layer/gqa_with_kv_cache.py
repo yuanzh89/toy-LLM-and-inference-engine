@@ -98,7 +98,7 @@ class GQAWithKVCache(nn.Module):
 
         self.o_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(self.llm_config.dropout)
 
-    def forward(self, sequences: list[Sequence], query_chunk_idxes: list[int] | None, is_prefill: bool = True) -> None:
+    def forward(self, sequences: list[Sequence], query_chunk_idxes: list[int] | None = None, is_prefill: bool = True) -> None:
         """
         Run GQA on a single query chunk and write the result back into the sequence.
 
@@ -259,9 +259,9 @@ class GQAWithKVCache(nn.Module):
 
         # Batched decoding starts
         activations = [seq.decode_activations for seq in sequences]
-        # [batch_size = num_seq, seq_len == 1, d_model]
+        # [batch_size, seq_len == 1, d_model]
         x = torch.cat(activations, dim=0)
-        # [batch_size = num_seq, seq_len == 1, d_model]
+        # [batch_size, seq_len == 1, d_model]
         x = self.rms_norm(x)
 
         # [batch_size, num_heads, seq_len == 1, head_dim]

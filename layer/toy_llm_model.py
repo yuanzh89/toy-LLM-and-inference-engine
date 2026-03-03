@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from config import ToyLLMConfig
 from engine.block_manager import BlockManager
-from engine.sequence import Sequence
+from engine.sequence import Sequence, SequenceStatus
 from transformer_block_with_kv_cache import TransformerBlock
 
 
@@ -74,7 +74,8 @@ class ToyLLMModel(nn.Module):
         # Weight tying: share parameters between the embedding table and the LM head.
         self.lm_head.weight = self.embedding.weight
 
-    def forward(self, sequences: list[Sequence], query_chunk_idxes: list[int]) -> list[int]:
+    def forward(self, sequences: list[Sequence], query_chunk_idxes: list[int] | None = None,
+                is_prefill: bool = True) -> None:
         """
         Run a single forward pass for one query chunk and return the next token ID.
 
@@ -96,6 +97,19 @@ class ToyLLMModel(nn.Module):
             The token ID with the highest probability for the *next* position
             (i.e. greedy decoding of the last token in the chunk).
         """
+        if is_prefill:
+            assert len(sequences) == len(query_chunk_idxes) == 1
+            assert sequences[0].status == SequenceStatus.PREFILL_PENDING
+        else:
+            assert all([seq.status == SequenceStatus.DECODE_PENDING for seq in
+                        sequences]), "All input sequences should be in DECODE_PENDING status for batched decoding."
+
+        if is_prefill:
+            self.prefill_a_chunk(sequences[0], query_chunk_idxes[0])
+        else:
+            self.decode_a_batch(sequences)
+
+    def prefill_a_chunk(self, seq: Sequence, query_chunk_idx: int) -> None:
         token_ids_in_chunks = seq.token_ids_in_chunks()
         assert 0 <= query_chunk_idx < len(token_ids_in_chunks)
 
@@ -129,4 +143,33 @@ class ToyLLMModel(nn.Module):
         # Append the newly generated token so subsequent steps see it.
         seq.append_token(next_token_id.item())
 
-        return next_token_id.item()
+    def decode_a_batch(self, sequences: list[Sequence]) -> None:
+        # [batch_size, seq_len == 1]
+        token_ids = torch.tensor([seq.get_last_token_id() for seq in sequences]).unsqueeze(1)
+
+        # [batch_size, seq_len == 1, d_model]
+        x = self.embedding(token_ids)
+
+        for idx, seq in enumerate(sequences):
+            # Initialize activations for decode
+            seq.decode_activations = x[idx, :, :]
+
+        for transformer_layer in self.transformer_layers:
+            transformer_layer(sequences)
+
+        # [batch_size, seq_len == 1, d_model]
+        x = torch.cat([seq.decode_activations for seq in sequences], dim=0)
+        x = self.rms_norm(x)
+
+        # Project to vocabulary logits and compute probabilities.
+        # [B, chunk_seq_len, vocab_size]
+        logits = self.lm_head(x)
+        probs = F.softmax(logits, dim=-1)
+
+        # Greedy decode: take the argmax at the last token position only.
+        # [B, vocab_size] → [B]
+        next_token_id = torch.argmax(probs[:, -1, :], dim=-1)
+
+        # Append the newly generated token so subsequent steps see it.
+        for idx, seq in enumerate(sequences):
+            seq.append_token(next_token_id[idx].item())
