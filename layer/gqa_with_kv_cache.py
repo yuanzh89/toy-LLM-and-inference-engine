@@ -4,10 +4,12 @@ import math
 
 import torch
 import torch.nn as nn
+from mpmath import residual
+from torch.nn import functional as F
 
 from config import ToyLLMConfig
 from engine.block_manager import BlockManager
-from engine.sequence import Sequence
+from engine.sequence import Sequence, SequenceStatus
 from kernel.triton.flash_attention import flash_attention
 from layer.rope import apply_rope
 
@@ -38,7 +40,7 @@ class GQAWithKVCache(nn.Module):
     3. Reads the full KV cache back from all blocks and expands each KV head to
        match its query-head group before calling flash attention.
     4. Writes the attention output back into
-       ``seq.chunked_activations[query_chunk_idx]``.
+       ``seq.prefill_chunked_activations[query_chunk_idx]``.
 
     Parameters
     ----------
@@ -60,7 +62,7 @@ class GQAWithKVCache(nn.Module):
 
     Shape
     -----
-    Input / output (via ``seq.chunked_activations``): ``[B, chunk_seq_len, d_model]``
+    Input / output (via ``seq.prefill_chunked_activations``): ``[B, chunk_seq_len, d_model]``
     """
 
     def __init__(
@@ -94,9 +96,43 @@ class GQAWithKVCache(nn.Module):
         self.v_proj = nn.Linear(self.llm_config.d_model, self.llm_config.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.llm_config.d_model, self.llm_config.d_model, bias=False)
 
-        self.o_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(dropout)
+        self.o_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(self.llm_config.dropout)
 
-    def forward(self, seq: Sequence, query_chunk_idx: int) -> None:
+    def forward(self, sequences: list[Sequence], query_chunk_idxes: list[int] | None, is_prefill: bool = True) -> None:
+        """
+        Run GQA on a single query chunk and write the result back into the sequence.
+
+        Parameters
+        ----------
+        sequences : list[Sequence]
+            A list of sequences to be processed at each forward step.
+            There are two modes of operation:
+            1. Prefill mode, where we always guarantee that the len(sequences) == 1
+            2. Decode mode, where  1 <= len(sequences) <= decode_max_batch_size
+
+            We could tell the current operation mode by reading the len(sequences) and
+            sequence.status == PREFILL_PENDING
+
+        query_chunk_idxes : list[int]
+            Zero-based index of the query chunk to process.  Activations are read
+            from ``seq.prefill_chunked_activations[query_chunk_idx]`` and written back to
+            the same slot after the residual connection.
+
+            This parameter only make sense in chunked prefill mode, and will be None and ignored in decode mode.
+        """
+        if is_prefill:
+            assert len(sequences) == len(query_chunk_idxes) == 1
+            assert sequences[0].status == SequenceStatus.PREFILL_PENDING
+        else:
+            assert all([seq.status == SequenceStatus.DECODE_PENDING for seq in
+                        sequences]), "All input sequences should be in DECODE_PENDING status for batched decoding."
+
+        if is_prefill:
+            self.prefill_a_chunk(sequences[0], query_chunk_idxes[0])
+        else:
+            self.decode_a_batch(sequences)
+
+    def prefill_a_chunk(self, seq: Sequence, query_chunk_idx: int) -> None:
         """
         Run GQA on a single query chunk and write the result back into the sequence.
 
@@ -106,7 +142,7 @@ class GQAWithKVCache(nn.Module):
             The sequence being processed.
         query_chunk_idx : int
             Zero-based index of the query chunk to process.  Activations are read
-            from ``seq.chunked_activations[query_chunk_idx]`` and written back to
+            from ``seq.prefill_chunked_activations[query_chunk_idx]`` and written back to
             the same slot after the residual connection.
         """
         # x: [B, chunk_seq_len, d_model]
@@ -216,4 +252,81 @@ class GQAWithKVCache(nn.Module):
         output = self.o_dropout(output)
 
         # The result must be stored back into the specific chunk slot.
-        seq.chunked_activations[query_chunk_idx] = residual + output
+        seq.prefill_chunked_activations[query_chunk_idx] = residual + output
+
+    def decode_a_batch(self, sequences: list[Sequence]) -> None:
+        batch_size = len(sequences)
+
+        # Batched decoding starts
+        activations = [seq.decode_activations for seq in sequences]
+        # [batch_size = num_seq, seq_len == 1, d_model]
+        x = torch.cat(activations, dim=0)
+        # [batch_size = num_seq, seq_len == 1, d_model]
+        x = self.rms_norm(x)
+
+        # [batch_size, num_heads, seq_len == 1, head_dim]
+        q = self.q_proj(x).view(
+            batch_size,
+            1,
+            self.llm_config.num_query_heads,
+            self.head_dim).transpose(1, 2).contiguous()
+        k = self.k_proj(x).view(batch_size, 1, self.llm_config.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = self.v_proj(x).view(batch_size, 1, self.llm_config.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+
+        pos_offsets = [len(seq.token_ids) - 1 for seq in sequences]
+        # Apply RoPE on Q and K
+        apply_rope(q, self.head_dim, start_pos=pos_offsets)
+        apply_rope(k, self.head_dim, start_pos=pos_offsets)
+
+        for idx, seq in enumerate(sequences):
+            # Append new KV cache into matching sequences
+            seq.append_kv_cache(self.layer_id, k[idx, :, :, :], v[idx, :, :, :])
+
+        # Get sequence lengths for each KV cache
+        kv_seq_lens = []
+        for seq in sequences:
+            total_len = sum(blk.k_cache[self.layer_id].shape[2] for blk in seq.kv_cache_blocks)
+            kv_seq_lens.append(total_len)
+
+        max_kv_len = max(kv_seq_lens)
+
+        k_full = []
+        v_full = []
+        for seq in sequences:
+            k = torch.cat([blk.k_cache[self.layer_id] for blk in seq.kv_cache_blocks], dim=2)
+            v = torch.cat([blk.v_cache[self.layer_id] for blk in seq.kv_cache_blocks], dim=2)
+
+            # Pad to max_kv_len on the seq_len dimension (dim=2)
+            pad_len = max_kv_len - k.shape[2]
+            if pad_len > 0:
+                k = F.pad(k, (0, 0, 0, pad_len))  # pad last two dims: (head_dim, seq_len)
+                v = F.pad(v, (0, 0, 0, pad_len))
+
+            k_full.append(k)
+            v_full.append(v)
+
+        # [batch_size, num_kv_heads, max_kv_len, head_dim]
+        k_full = torch.cat(k_full, dim=0)
+        v_full = torch.cat(v_full, dim=0)
+
+        # Build attention mask: True = ignore this position
+        # [batch_size, 1, q_len=1, max_kv_len]
+        attn_mask = torch.zeros(batch_size, 1, 1, max_kv_len, dtype=torch.bool, device=k_full.device)
+        for i, seq_len in enumerate(kv_seq_lens):
+            attn_mask[i, 0, 0, seq_len:] = True  # mask out padding
+
+        o = F.scaled_dot_product_attention(
+            q, k_full, v_full,
+            attn_mask=~attn_mask,
+        )
+
+        o = o.transpose(1, 2).reshape(batch_size, 1, self.llm_config.d_model)
+
+        o = self.o_proj(o)
+        o = self.o_dropout(o)
+
+        output = o + residual
+
+        for idx, seq in enumerate(sequences):
+            # Decode activation shape: [batch_size == 1, seq_len == 1, d_model] per sequence
+            seq.decode_activations = output[idx, :, :]

@@ -28,7 +28,7 @@ class SwiGLUFFNLayer(nn.Module):
 
     Shape
     -----
-    Input / output (via ``seq.chunked_activations``): ``[B, chunk_seq_len, d_model]``
+    Input / output (via ``seq.prefill_chunked_activations``): ``[B, chunk_seq_len, d_model]``
     """
 
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
@@ -55,7 +55,7 @@ class SwiGLUFFNLayer(nn.Module):
             The sequence whose activations will be read and updated.
         query_chunk_idx : int
             Zero-based index of the query chunk to process.  The layer reads
-            ``seq.chunked_activations[query_chunk_idx]`` and writes the result
+            ``seq.prefill_chunked_activations[query_chunk_idx]`` and writes the result
             back to the same slot.
         """
 
@@ -70,7 +70,7 @@ class SwiGLUFFNLayer(nn.Module):
 
         output = self.dropout(output)
 
-        seq.chunked_activations[query_chunk_idx] = output + residual
+        seq.prefill_chunked_activations[query_chunk_idx] = output + residual
 
 
 class FusedSwiGLUFFNLayer(nn.Module):

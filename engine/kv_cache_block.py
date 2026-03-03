@@ -105,9 +105,12 @@ class Block:
         """Return the number of token IDs currently stored in this block."""
         return len(self.token_ids)
 
+    def is_full(self):
+        return len(self.token_ids) == self.max_token_size_per_kv_cache_block
+
     def can_append(self) -> bool:
         """Return ``True`` if this block is in decode-only mode (not yet in the trie)."""
-        return self.trie_tree_depth == 0
+        return self.trie_tree_depth == 0 and
 
     # ------------------------------------------------------------------
     # Reference counting
@@ -241,7 +244,7 @@ class Block:
         assert 0 <= layer_id < self.num_transformer_layers
         assert len(new_token_ids) > 0, "new_token_ids must not be empty"
         assert (
-            len(self.token_ids) + len(new_token_ids) <= self.max_token_size_per_kv_cache_block
+                len(self.token_ids) + len(new_token_ids) <= self.max_token_size_per_kv_cache_block
         ), "Appending token IDs would exceed max_token_size_per_kv_cache_block"
         assert self.k_cache[layer_id] is not None, (
             f"Layer {layer_id} has not been written via prefill_write_kv_cache; "
@@ -264,3 +267,5 @@ class Block:
         # Concatenate along the sequence-length dimension (dim=2).
         self.k_cache[layer_id] = torch.cat([self.k_cache[layer_id], k_cache], dim=2)
         self.v_cache[layer_id] = torch.cat([self.v_cache[layer_id], v_cache], dim=2)
+
+        # TODO: Seal the KV cache block once full after append.

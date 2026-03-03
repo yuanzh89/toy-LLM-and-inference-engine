@@ -43,11 +43,6 @@ class TransformerBlock(nn.Module):
             llm_config: ToyLLMConfig,
             block_manager: BlockManager,
             layer_id: int,
-            d_model: int,
-            d_ff: int,
-            num_query_heads: int,
-            num_kv_heads: int,
-            dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -59,7 +54,6 @@ class TransformerBlock(nn.Module):
             self.llm_config,
             self.block_manager,
             self.layer_id,
-            dropout=self.dropout,
         )
         self.swiglu_ffn = SwiGLUFFNLayer(self.llm_config.d_model, self.llm_config.d_ff, dropout=self.llm_config.dropout)
 
@@ -71,7 +65,7 @@ class TransformerBlock(nn.Module):
         ----------
         seq : Sequence
             The sequence being processed.  Activations are read from and written
-            back to ``seq.chunked_activations[query_chunk_idx]``.
+            back to ``seq.prefill_chunked_activations[query_chunk_idx]``.
         query_chunk_idx : int
             Zero-based index of the query chunk within the sequence's chunked
             activations.

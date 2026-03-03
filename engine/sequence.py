@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from engine import block_manager
+
 if TYPE_CHECKING:
     from kv_cache_block import Block
 
@@ -64,7 +66,7 @@ class Sequence:
         Hard cap on the total number of tokens (prompt + decode).
     query_chunk_size : int
         Number of tokens processed per attention query chunk.
-    chunked_activations : list[torch.Tensor | None]
+    prefill_chunked_activations : list[torch.Tensor | None]
         Intermediate hidden-state tensors, one per query chunk.
         Shape of each entry: ``[batch_size, chunk_seq_len, d_model]``.
         Populated by the embedding layer and updated by each transformer block.
@@ -94,9 +96,15 @@ class Sequence:
         self.query_chunk_size = query_chunk_size
         self._num_query_chunks = math.ceil(len(token_ids) / self.query_chunk_size)
 
+        # This is query chunk wise activations for prefill only.
         # One activation tensor per query chunk; filled by the embedding layer and
         # updated in-place by each transformer block.  Shape: [B, chunk_len, d_model].
-        self.chunked_activations: list[torch.Tensor | None] = [None] * self._num_query_chunks
+        self.prefill_chunked_activations: list[torch.Tensor | None] = [None] * self._num_query_chunks
+
+        # Decode activation with seq_len == 1
+        # Initialized by embedding layer
+        # Tensor shape for the current sequence: [batch_size == 1, seq_len == 1, d_model]
+        self.decode_activations: torch.Tensor | None = None
 
         # Populated by BlockManager; one block per KV-cache chunk.
         self.kv_cache_blocks: list[Block | None] = []
@@ -126,7 +134,7 @@ class Sequence:
         Parameters
         ----------
         query_chunk_idx : int
-            Zero-based index into ``chunked_activations``.
+            Zero-based index into ``prefill_chunked_activations``.
 
         Returns
         -------
@@ -135,7 +143,7 @@ class Sequence:
             embedding layer has not yet been run for that chunk.
         """
         assert 0 <= query_chunk_idx < self._num_query_chunks
-        return self.chunked_activations[query_chunk_idx]
+        return self.prefill_chunked_activations[query_chunk_idx]
 
     def get_full_activations(self) -> torch.Tensor:
         """
@@ -151,25 +159,15 @@ class Sequence:
         ValueError
             If any chunk activation is still ``None`` (embedding not yet run).
         """
-        if any(a is None for a in self.chunked_activations):
+        if any(a is None for a in self.prefill_chunked_activations):
             raise ValueError(
-                "Not all chunked_activations have been populated; "
+                "Not all prefill_chunked_activations have been populated; "
                 "call the embedding layer before get_full_activations()."
             )
-        return torch.cat(self.chunked_activations, dim=1)
+        return torch.cat(self.prefill_chunked_activations, dim=1)
 
-    def get_last_token_activations(self) -> torch.Tensor:
-        """
-        Return the hidden state of the very last token across all chunks.
-
-        Returns
-        -------
-        torch.Tensor
-            Shape ``[batch_size, 1, d_model]``.
-        """
-        last_chunk = self.chunked_activations[-1]
-        assert last_chunk is not None, "Last chunk activations have not been computed yet."
-        return last_chunk[:, -1:, :]   # [batch_size, 1, d_model]
+    def get_decode_activations(self) -> torch.Tensor | None:
+        return self.decode_activations
 
     # ------------------------------------------------------------------
     # Token management
@@ -204,6 +202,9 @@ class Sequence:
             self.token_ids[i: i + self.max_token_size_per_kv_cache_block]
             for i in range(0, len(self.token_ids), self.max_token_size_per_kv_cache_block)
         ]
+
+    def get_last_token_id(self) -> int:
+        return self.token_ids[-1]
 
     # ------------------------------------------------------------------
     # KV-cache block management
@@ -249,6 +250,15 @@ class Sequence:
         )
         self.kv_cache_blocks = copy(kv_cache_blocks)
         self.kv_cache_blocks_initialized = True
+
+    def append_kv_cache(self, layer_id: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor) -> None:
+        last_block = self.kv_cache_blocks[-1]
+        if not last_block.is_full() and last_block.can_append():
+            last_block.decode_append_token_ids_and_kv_cache(layer_id, [self.get_last_token_id()],k_tensor, v_tensor)
+            return
+
+        # TODO: Allocate new block for appending.
+        pass
 
     def release(self) -> None:
         """

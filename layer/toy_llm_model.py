@@ -64,11 +64,6 @@ class ToyLLMModel(nn.Module):
                 llm_config,
                 block_manager,
                 layer_id=layer_id,
-                d_model=llm_config.d_model,
-                d_ff=llm_config.d_ff,
-                num_query_heads=llm_config.num_query_heads,
-                num_kv_heads=llm_config.num_kv_heads,
-                dropout=llm_config.dropout,
             )
             for layer_id in range(llm_config.num_transformer_layers)
         )
@@ -79,7 +74,7 @@ class ToyLLMModel(nn.Module):
         # Weight tying: share parameters between the embedding table and the LM head.
         self.lm_head.weight = self.embedding.weight
 
-    def forward(self, seq: Sequence, query_chunk_idx: int) -> int:
+    def forward(self, sequences: list[Sequence], query_chunk_idxes: list[int]) -> list[int]:
         """
         Run a single forward pass for one query chunk and return the next token ID.
 
@@ -112,14 +107,14 @@ class ToyLLMModel(nn.Module):
 
         # Initialise chunk activations from the embedding table.
         # Shape: [B, chunk_seq_len, d_model]
-        seq.chunked_activations[query_chunk_idx] = self.embedding(token_ids_chunk)
+        seq.prefill_chunked_activations[query_chunk_idx] = self.embedding(token_ids_chunk)
 
         # Run each transformer block on this chunk.
         for transformer_layer in self.transformer_layers:
             transformer_layer(seq, query_chunk_idx)
 
         # Read the updated activations for this chunk, apply final norm, and project.
-        x = seq.chunked_activations[query_chunk_idx]   # [B, chunk_seq_len, d_model]
+        x = seq.prefill_chunked_activations[query_chunk_idx]  # [B, chunk_seq_len, d_model]
         x = self.rms_norm(x)
 
         # Project to vocabulary logits and compute probabilities.
