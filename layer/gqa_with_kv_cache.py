@@ -68,38 +68,31 @@ class GQAWithKVCache(nn.Module):
             llm_config: ToyLLMConfig,
             block_manager: BlockManager,
             layer_id: int,
-            d_model: int,
-            num_query_heads: int,
-            num_kv_heads: int,
-            dropout: float = 0.1,
     ):
         super().__init__()
 
-        assert d_model % num_query_heads == 0, \
+        assert self.llm_config.d_model % self.llm_config.num_query_heads == 0, \
             "d_model must be divisible by num_query_heads"
-        assert num_query_heads >= num_kv_heads, \
+        assert self.llm_config.num_query_heads >= self.llm_config.num_kv_heads, \
             "num_query_heads must be >= num_kv_heads"
-        assert num_query_heads % num_kv_heads == 0, \
+        assert self.llm_config.num_query_heads % self.llm_config.num_kv_heads == 0, \
             "num_query_heads must be divisible by num_kv_heads"
 
         self.llm_config = llm_config
         self.block_manager = block_manager
         self.layer_id = layer_id
-        self.d_model = d_model
-        self.num_query_heads = num_query_heads
-        self.num_kv_heads = num_kv_heads
-        self.dropout = dropout
+
         # How many Q heads share each single KV head.
-        self.group_size = num_query_heads // num_kv_heads
+        self.group_size = self.llm_config.num_query_heads // self.llm_config.num_kv_heads
 
-        self.head_dim = d_model // num_query_heads
+        self.head_dim = self.llm_config.d_model // self.llm_config.num_query_heads
 
-        self.rms_norm = nn.RMSNorm(d_model, eps=1e-9)
+        self.rms_norm = nn.RMSNorm(self.llm_config.d_model, eps=1e-9)
 
-        self.q_proj = nn.Linear(d_model, num_query_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        self.q_proj = nn.Linear(self.llm_config.d_model, self.llm_config.num_query_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.llm_config.d_model, self.llm_config.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.llm_config.d_model, self.llm_config.num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.llm_config.d_model, self.llm_config.d_model, bias=False)
 
         self.o_dropout = nn.Identity() if math.isclose(self.dropout, 0.0) else nn.Dropout(dropout)
 
@@ -122,7 +115,7 @@ class GQAWithKVCache(nn.Module):
         residual = x
 
         # Pre-norm before attention projections.
-        x = self.rms_norm(x)   # [B, seq_len, d_model]
+        x = self.rms_norm(x)  # [B, seq_len, d_model]
 
         block_size = self.llm_config.max_token_size_per_kv_cache_block
 
@@ -143,7 +136,7 @@ class GQAWithKVCache(nn.Module):
         if block_idx < len(seq.kv_cache_blocks):
             # Slice the tokens whose KV cache has not been computed yet.
             partial_start = block_idx * block_size
-            kv_input = x[:, partial_start:, :]   # [B, partial_len, d_model]
+            kv_input = x[:, partial_start:, :]  # [B, partial_len, d_model]
             partial_len = kv_input.shape[1]
 
             # K projection → reshape → [B, num_kv_heads, partial_len, head_dim]
@@ -183,10 +176,10 @@ class GQAWithKVCache(nn.Module):
         # ------------------------------------------------------------------ #
         k_full = torch.cat(
             [blk.k_cache[self.layer_id] for blk in seq.kv_cache_blocks], dim=2
-        )   # [B, num_kv_heads, total_seq_len, head_dim]
+        )  # [B, num_kv_heads, total_seq_len, head_dim]
         v_full = torch.cat(
             [blk.v_cache[self.layer_id] for blk in seq.kv_cache_blocks], dim=2
-        )   # [B, num_kv_heads, total_seq_len, head_dim]
+        )  # [B, num_kv_heads, total_seq_len, head_dim]
 
         # ------------------------------------------------------------------ #
         # Step 4 – GQA head expansion.                                        #
@@ -203,13 +196,13 @@ class GQAWithKVCache(nn.Module):
         # ------------------------------------------------------------------ #
         # Step 5 – Q projection, RoPE, then chunked-prefill attention.        #
         # ------------------------------------------------------------------ #
-        q = self.q_proj(x)   # [B, seq_len, num_query_heads * head_dim]
+        q = self.q_proj(x)  # [B, seq_len, num_query_heads * head_dim]
         q = (
             q
             .view(batch_size, seq_len, self.num_query_heads, self.head_dim)
             .transpose(1, 2)
             .contiguous()
-        )   # [B, num_query_heads, seq_len, head_dim]
+        )  # [B, num_query_heads, seq_len, head_dim]
 
         # Q positions always start at absolute position 0 for the full sequence.
         apply_rope(q, self.head_dim, start_pos=0)
@@ -219,7 +212,7 @@ class GQAWithKVCache(nn.Module):
         # Merge heads back → [B, seq_len, d_model]
         o = o.transpose(1, 2).reshape(batch_size, seq_len, d_model)
 
-        output = self.o_proj(o)      # [B, seq_len, d_model]
+        output = self.o_proj(o)  # [B, seq_len, d_model]
         output = self.o_dropout(output)
 
         # The result must be stored back into the specific chunk slot.

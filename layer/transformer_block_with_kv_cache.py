@@ -54,22 +54,14 @@ class TransformerBlock(nn.Module):
         self.llm_config = llm_config
         self.block_manager = block_manager
         self.layer_id = layer_id
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.num_query_heads = num_query_heads
-        self.num_kv_heads = num_kv_heads
-        self.dropout = dropout
 
         self.group_query_attention = GQAWithKVCache(
             self.llm_config,
             self.block_manager,
             self.layer_id,
-            self.d_model,
-            self.num_query_heads,
-            self.num_kv_heads,
             dropout=self.dropout,
         )
-        self.swiglu_ffn = SwiGLUFFNLayer(self.d_model, self.d_ff, dropout=self.dropout)
+        self.swiglu_ffn = SwiGLUFFNLayer(self.llm_config.d_model, self.llm_config.d_ff, dropout=self.llm_config.dropout)
 
     def forward(self, seq: Sequence, query_chunk_idx: int) -> None:
         """

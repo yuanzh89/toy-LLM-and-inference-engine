@@ -27,11 +27,11 @@ class SequenceStatus(IntEnum):
     FAILED : int
         Allocation or processing failed; the sequence has been dropped.
     """
-    FINISHED = 1
-    RUNNING = 2
-    WAITING = 3
-    FAILED = 4
-
+    START = 1
+    INITIALIZED = 2
+    PREFILL_PENDING = 3
+    DECODE_PENDING = 4
+    FINISHED = 5
 
 class Sequence:
     """
@@ -86,7 +86,7 @@ class Sequence:
             query_chunk_size: int,
     ):
         self.seq_id: int = next(Sequence.counter)
-        self.status: SequenceStatus = SequenceStatus.WAITING
+        self.status: SequenceStatus = SequenceStatus.START
         self.token_ids: list[int] = copy(token_ids)
         self.num_prompt_tokens: int = len(token_ids)
         self.max_token_size_per_kv_cache_block = max_token_size_per_kv_cache_block
