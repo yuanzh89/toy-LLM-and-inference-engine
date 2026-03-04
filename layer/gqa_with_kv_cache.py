@@ -41,7 +41,7 @@ class GQAWithKVCache(nn.Module):
     head_dim : int
         Per-head feature dimension (``d_model // num_query_heads``).
     rms_norm : nn.RMSNorm
-        Pre-attention layer normalisation.
+        Pre-attention layer normalization.
     q_proj, k_proj, v_proj : nn.Linear
         Query, key, and value projection matrices (no bias).
     o_proj : nn.Linear
