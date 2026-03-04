@@ -1,88 +1,134 @@
-from collections import deque
+from multiprocessing import Queue
 
-from block_manager import BlockManager
-from config import Config
+from config import ToyLLMConfig
 from sequence import Sequence, SequenceStatus
 
 
+class Tokenizer:
+    """Stub tokenizer.  Replace ``tokenize`` with a real implementation."""
+
+    # Dummy EOS token ID used to detect end-of-sequence during generation.
+    EOS_TOKEN_ID = 10000
+
+    def __init__(self, config: ToyLLMConfig):
+        self.config = config
+
+    def tokenize(self, prompt: str) -> list[int]:
+        """
+        Convert *prompt* to a list of token IDs.
+
+        Parameters
+        ----------
+        prompt : str
+            Raw text prompt.
+
+        Returns
+        -------
+        list[int]
+            Sequence of integer token IDs.
+        """
+        # TODO: implement with a real tokeniser (e.g. tiktoken, sentencepiece).
+        pass
+
+
 class Scheduler:
+    """
+    Coordinates the flow of sequences between the tokeniser, prefill runner,
+    and decode runner.
 
-    def __init__(self, config: Config):
-        self.max_num_seqs = config.max_num_seqs
-        self.max_num_batched_tokens = config.max_num_batched_tokens
-        self.eos = config.eos
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+    Queue ownership
+    ---------------
+    * ``prefill_queue`` – scheduler **produces**; prefill runner **consumes**.
+    * ``decode_schedule_queue`` – scheduler **consumes**; both runners **produce**.
+      Carries sequences that have just completed a prefill chunk or a decode step
+      and need the scheduler to decide what happens next.
+    * ``decode_worker_queue`` – scheduler **produces**; decode runner **consumes**.
+      Carries sequences that are ready for the next decode step.
 
-        # Sequences waiting for prefilling
-        self.waiting: deque[Sequence] = deque(maxlen=self.max_num_seqs)
-        # Sequences waiting for decoding
-        self.running: deque[Sequence] = deque(maxlen=self.max_num_seqs)
+    Parameters
+    ----------
+    llm_config : ToyLLMConfig
+        Unified model and inference configuration.
+    tokenizer : Tokenizer
+        Used to convert raw prompt strings to token ID lists.
+    prompts : list[str]
+        The initial set of prompts to process.
+    decode_schedule_queue : Queue[Sequence]
+        Inbound queue: receives sequences from the runners after each step.
+    prefill_queue : Queue[Sequence]
+        Outbound queue: newly tokenised sequences waiting for prefill.
+    decoder_queue : Queue[Sequence]
+        Outbound queue: sequences ready for the next decode step.
 
-    def is_finished(self) -> bool:
-        """Check if all sequences are finished or not."""
-        return not self.waiting and not self.running
+    Attributes
+    ----------
+    finished_sequences : list[Sequence]
+        Accumulates sequences that have reached EOS or max length.
+    """
 
-    def add(self, seq: Sequence):
-        """Add a sequence for prefilling then decoding."""
-        self.waiting.append(seq)
+    SENTINEL = None
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def __init__(
+            self,
+            llm_config: ToyLLMConfig,
+            tokenizer: Tokenizer,
+            prompts: list[str],
+            decode_schedule_queue: Queue[Sequence],
+            prefill_queue: Queue[Sequence],
+            decoder_queue: Queue[Sequence],
+    ):
+        self.llm_config = llm_config
+        self.tokenizer = tokenizer
+        self.prompts = prompts
+
+        # Inbound: receives sequences after each prefill chunk or decode step.
+        self.decode_schedule_queue = decode_schedule_queue
+        # Outbound: newly tokenised sequences waiting for prefill.
+        self.prefill_queue = prefill_queue
+        # Outbound: sequences dispatched for the next decode step.
+        self.decode_worker_queue = decoder_queue
+
+        self.eos_token_id = Tokenizer.EOS_TOKEN_ID
+        self.finished_sequences: list[Sequence] = []
+
+    def step(self) -> None:
+        """Single scheduler tick (stub — extend as needed)."""
+        pass
+
+    def run(self) -> None:
         """
-        Get the scheduled sequences.
+        Main scheduler loop.
 
-        Returns:
-            scheduled_seqs: the scheduled sequences.
-            is_prefilled: whether the sequences are finished or not.
+        1. Tokenises all input prompts and pushes them onto ``prefill_queue``.
+        2. Reads completed-step sequences from ``decode_schedule_queue``.
+        3. Sequences that generated EOS are marked ``FINISHED`` and collected.
+        4. All other sequences are re-dispatched to ``decode_worker_queue`` for
+           their next decode step.
+
+        Exits when it receives the sentinel value from ``decode_schedule_queue``.
         """
-        # Prefill
-        scheduled_seqs = []
-        num_seqs = 0
-        num_batched_tokens = 0
+        # Send all prompts to the prefill runner.
+        for prompt in self.prompts:
+            self.prefill_queue.put(
+                Sequence(
+                    self.tokenizer.tokenize(prompt),
+                    self.llm_config.max_token_size_per_kv_cache_block,
+                    self.llm_config.max_sequence_length,
+                    self.llm_config.query_chunk_size,
+                )
+            )
 
-        # Prioritize prefilling over decoding
-        while self.waiting and num_seqs < self.max_num_seqs:
-            seq = self.waiting[0]
-            if num_batched_tokens > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+        # Process sequences as they complete each step.
+        while True:
+            # Read from the inbound queue: sequences returned by the runners.
+            sequence = self.decode_schedule_queue.get()
+            if sequence is Scheduler.SENTINEL:
                 break
-            num_seqs += 1
-            self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
-            seq.status = SequenceStatus.RUNNING
-            self.waiting.popleft()
-            self.running.append(seq)
-            scheduled_seqs.append(seq)
 
-        if scheduled_seqs:
-            return scheduled_seqs, True
+            if sequence.get_last_token_id() == self.eos_token_id:
+                sequence.status = SequenceStatus.FINISHED
+                self.finished_sequences.append(sequence)
+                continue
 
-        # Decode
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                num_seqs += 1
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-
-        return scheduled_seqs, False
-
-    def preempt(self, seq: Sequence) -> None:
-        seq.status = SequenceStatus.WAITING
-        self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
-
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
-        for seq, token_id in zip(seqs, token_ids):
-            seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+            # Not finished — dispatch for the next decode step.
+            self.decode_worker_queue.put(sequence)

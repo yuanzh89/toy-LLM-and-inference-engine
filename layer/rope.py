@@ -3,6 +3,7 @@ from typing import Union
 import torch
 
 
+@torch.inference_mode()
 def apply_rope(
         x: torch.Tensor,
         rotary_dim: int,
@@ -30,7 +31,7 @@ def apply_rope(
         Modified **in-place**; no tensor is returned.
     rotary_dim : int
         Number of head dimensions to rotate.  Must be even and ≤ ``head_dim``.
-        A common setting is ``head_dim`` (full rotation) or ``head_dim // 2``.
+        Typically set to ``head_dim`` (full rotation).
     base : int, optional
         Base for the geometric frequency schedule (default: 10 000, matching the
         original RoPE paper).
@@ -38,22 +39,21 @@ def apply_rope(
         Absolute token offset(s) for the first position in *x*.
 
         * **int** – the same offset is applied to every sequence in the batch
-          (e.g. prefill from the start with ``0``).
+          (e.g. prefill from the start with ``0``, or a specific chunk offset).
         * **list[int]** – one offset per sequence in the batch (length must equal
-          ``B``).  Use this when different sequences in the batch have different
-          numbers of tokens already cached, so each sequence receives the correct
-          absolute positions during a decode step.
+          ``B``).  Use this during batched decode when different sequences have
+          different numbers of tokens already cached.
 
-        Default: 0.
+        Default: ``0``.
 
     Notes
     -----
     The rotation is applied to the ``(x_even, x_odd)`` pairs in the last dimension::
 
-        [ cos  -sin ] [ x_even ]   gives the rotated even outputs
-        [ sin   cos ] [ x_odd  ]   gives the rotated odd  outputs
+        [ cos  -sin ] [ x_even ]
+        [ sin   cos ] [ x_odd  ]
 
-    where the angle for head-dimension pair ``k`` at position ``p`` is::
+    where the angle for head-dimension pair ``k`` at absolute position ``p`` is::
 
         θ_{p,k} = p / base^(2k / rotary_dim)
 
@@ -61,7 +61,7 @@ def apply_rope(
 
         p = start_pos[b], start_pos[b] + 1, ..., start_pos[b] + T - 1
 
-    so that cos/sin tensors are shaped ``(B, 1, T, rotary_dim/2)`` rather than
+    so cos/sin tensors are shaped ``(B, 1, T, rotary_dim/2)`` rather than
     ``(1, 1, T, rotary_dim/2)``.
     """
 

@@ -1,41 +1,39 @@
+import torch
 import torch.nn as nn
 
 from config import ToyLLMConfig
 from engine.block_manager import BlockManager
-from engine.sequence import Sequence
+from engine.sequence import Sequence, SequenceStatus
 from layer.gqa_with_kv_cache import GQAWithKVCache
 from swiglu_ffn import SwiGLUFFNLayer
 
 
 class TransformerBlock(nn.Module):
     """
-    A single transformer decoder block consisting of:
+    A single decoder-only transformer block combining GQA and a SwiGLU FFN.
 
-    1. **Grouped-Query Attention (GQA)** with paged KV cache and chunked prefill.
-    2. **SwiGLU Feed-Forward Network** with pre-norm and residual connection.
-
-    Both sub-layers receive the same ``query_chunk_idx`` so they operate on the
-    same token-ID slice of the sequence's chunked activations.
+    Each block processes sequences in either prefill (one chunk at a time) or
+    decode (one token per sequence, batched) mode.  All activation state is
+    stored on the :class:`~engine.sequence.Sequence` objects; the block itself
+    is stateless between calls.
 
     Parameters
     ----------
     llm_config : ToyLLMConfig
-        Global model configuration (block size, chunk size, etc.).
+        Unified model and inference configuration.
     block_manager : BlockManager
-        Manages paged physical KV-cache blocks.
+        Passed through to :class:`~layer.gqa_with_kv_cache.GQAWithKVCache` so
+        that KV-cache block allocation can happen during the decode forward pass.
     layer_id : int
-        Zero-based index of this transformer layer; passed to :class:`GQAWithKVCache`
-        to index into the per-layer KV cache slots.
-    d_model : int
-        Model (embedding) dimension.
-    d_ff : int
-        Inner feed-forward dimension.
-    num_query_heads : int
-        Number of query attention heads.
-    num_kv_heads : int
-        Number of key/value heads (must evenly divide ``num_query_heads``).
-    dropout : float, optional
-        Dropout probability applied in both GQA and FFN.  Default: 0.1.
+        Zero-based layer index; used by GQA to read/write the correct KV-cache
+        slot on each :class:`~engine.sequence.Sequence`.
+
+    Attributes
+    ----------
+    group_query_attention : GQAWithKVCache
+        The grouped query attention sub-layer for this block.
+    swiglu_ffn : SwiGLUFFNLayer
+        The SwiGLU feed-forward sub-layer for this block.
     """
 
     def __init__(
@@ -55,21 +53,72 @@ class TransformerBlock(nn.Module):
             self.block_manager,
             self.layer_id,
         )
-        self.swiglu_ffn = SwiGLUFFNLayer(self.llm_config.d_model, self.llm_config.d_ff, dropout=self.llm_config.dropout)
+        self.swiglu_ffn = SwiGLUFFNLayer(
+            self.llm_config.d_model,
+            self.llm_config.d_ff,
+            dropout=self.llm_config.dropout,
+        )
 
-    def forward(self, seq: Sequence, query_chunk_idx: int) -> None:
+    @torch.inference_mode()
+    def forward(
+            self,
+            sequences: list[Sequence],
+            query_chunk_idxes: list[int] | None = None,
+            is_prefill: bool = True,
+    ) -> None:
         """
-        Run one transformer block on a single query chunk.
+        Dispatch to :meth:`prefill_a_chunk` or :meth:`decode_a_batch`.
+
+        Parameters
+        ----------
+        sequences : list[Sequence]
+            For prefill: a single-element list.  For decode: one entry per sequence
+            in the batch.
+        query_chunk_idxes : list[int] | None
+            Required for prefill; ignored for decode.
+        is_prefill : bool
+            ``True`` to run the prefill path, ``False`` for decode.
+        """
+        if is_prefill:
+            assert len(sequences) == len(query_chunk_idxes) == 1
+            assert sequences[0].status == SequenceStatus.PREFILL_PENDING
+        else:
+            assert all(
+                seq.status == SequenceStatus.DECODE_PENDING for seq in sequences
+            ), "All sequences must be in DECODE_PENDING status for batched decoding."
+
+        if is_prefill:
+            self.prefill_a_chunk(sequences[0], query_chunk_idxes[0])
+        else:
+            self.decode_a_batch(sequences)
+
+    @torch.inference_mode()
+    def decode_a_batch(self, sequences: list[Sequence]) -> None:
+        """
+        Run one decode step for a batch of sequences.
+
+        Calls GQA (which appends new K/V to the cache and computes attention)
+        followed by the FFN.  Both sub-layers receive ``is_prefill=False``.
+
+        Parameters
+        ----------
+        sequences : list[Sequence]
+            Batch of sequences in ``DECODE_PENDING`` status.
+        """
+        self.group_query_attention(sequences, is_prefill=False)
+        self.swiglu_ffn(sequences, is_prefill=False)
+
+    @torch.inference_mode()
+    def prefill_a_chunk(self, seq: Sequence, query_chunk_idx: int) -> None:
+        """
+        Run one prefill step for a single query chunk.
 
         Parameters
         ----------
         seq : Sequence
-            The sequence being processed.  Activations are read from and written
-            back to ``seq.prefill_chunked_activations[query_chunk_idx]``.
+            The sequence being prefilled.
         query_chunk_idx : int
-            Zero-based index of the query chunk within the sequence's chunked
-            activations.
+            Zero-based index of the query chunk to process.
         """
-
-        self.group_query_attention(seq, query_chunk_idx)
-        self.swiglu_ffn(seq, query_chunk_idx)
+        self.group_query_attention([seq], [query_chunk_idx], is_prefill=True)
+        self.swiglu_ffn([seq], [query_chunk_idx], is_prefill=True)

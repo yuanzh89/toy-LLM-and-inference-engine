@@ -21,13 +21,20 @@ class Block:
     ---------
     * **Prefill** – ``prefill_write_kv_cache`` writes the full key/value tensors for
       every token in the block at once.
-    * **Decode** – ``decode_append_token_ids_and_kv_cache`` appends one (or a few, for
-      speculative decoding) new key/value slices to an already-populated block.
+    * **Decode (extend)** – ``decode_append_token_ids_and_kv_cache`` appends one (or a
+      few, for speculative decoding) new key/value slices to an already-populated block.
+    * **Decode (new block)** – when the current block fills up during decode, a fresh
+      block is allocated by :class:`~block_manager.BlockManager`.  The first token's
+      KV is written via ``prefill_write_kv_cache``, and subsequent tokens use
+      ``decode_append_token_ids_and_kv_cache``.
+    * **Sealing** – once a decode block is full and all transformer layers have been
+      written, :meth:`~block_manager.BlockManager.seal_full_decode_blocks` inserts it
+      into the prefix-caching trie so future sequences can reuse it.
 
     Attributes
     ----------
     block_id : int
-        Unique identifier assigned by :class:`BlockManager`.
+        Unique identifier assigned by :class:`~block_manager.BlockManager`.
     token_ids : list[int]
         Token IDs whose KV cache is stored in this block.  Grows during decoding.
     num_transformer_layers : int
@@ -42,13 +49,15 @@ class Block:
     v_cache : list[torch.Tensor | None]
         Per-layer value tensors, same shape convention as ``k_cache``.
     trie_tree_depth : int
-        Depth of this block's node in the prefix-caching :class:`BlockTrieTree`.
-        Depth 0 means the block has not yet been inserted into the trie.
+        Depth of this block's node in the prefix-caching :class:`~prefix_caching.BlockTrieTree`.
+        ``0`` means the block has not yet been inserted into the trie (either it is a
+        partial/decode-only block, or sealing has not yet occurred).
         Used for eviction ordering: deeper blocks are evicted first.
     trie_node : BlockTrieNode | None
-        Direct back-reference to the :class:`BlockTrieNode` that owns this block.
-        Set by :class:`BlockManager` at allocation time and used for O(1) trie
-        removal during eviction.  ``None`` for blocks that are not in the trie.
+        Direct back-reference to the :class:`~prefix_caching.BlockTrieNode` that owns
+        this block.  Set by :class:`~block_manager.BlockManager` at allocation or
+        sealing time and used for O(1) trie removal during eviction.  ``None`` for
+        blocks that are not in the trie.
     """
 
     def __init__(
@@ -69,12 +78,12 @@ class Block:
         self.k_cache: list[torch.Tensor | None] = [None] * self.num_transformer_layers
         self.v_cache: list[torch.Tensor | None] = [None] * self.num_transformer_layers
 
-        # Set by BlockManager when this block is inserted into the prefix-caching trie.
-        # Depth 0 means the block is not yet in the trie.
+        # 0 means the block is not yet in the trie (partial or newly allocated decode block).
+        # Set to a positive value by BlockManager when the block is inserted or sealed.
         self.trie_tree_depth: int = 0
 
         # Back-reference to the trie node; enables O(1) removal during eviction.
-        # Set by BlockManager.allocate_block(); None until that call completes.
+        # None until BlockManager.allocate_block() or seal_full_decode_blocks() sets it.
         self.trie_node: BlockTrieNode | None = None
 
     # ------------------------------------------------------------------
@@ -105,11 +114,18 @@ class Block:
         """Return the number of token IDs currently stored in this block."""
         return len(self.token_ids)
 
-    def is_full(self):
+    def is_full(self) -> bool:
+        """Return ``True`` if this block's token slots are all occupied."""
         return len(self.token_ids) == self.max_token_size_per_kv_cache_block
 
     def can_append(self) -> bool:
-        """Return ``True`` if this block is in decode-only mode (not yet in the trie)."""
+        """
+        Return ``True`` if this block is in decode-only mode (not yet in the trie).
+
+        A block that has been inserted into the prefix-caching trie has a fixed token
+        sequence and must not be extended.  Only blocks with ``trie_tree_depth == 0``
+        (i.e. partial last blocks and freshly allocated decode blocks) are appendable.
+        """
         return self.trie_tree_depth == 0
 
     # ------------------------------------------------------------------
@@ -153,10 +169,11 @@ class Block:
             self, layer_id: int, k_cache: torch.Tensor, v_cache: torch.Tensor
     ) -> None:
         """
-        Store the full prefill KV tensors for a transformer layer.
+        Store the full KV tensors for a transformer layer.
 
-        Called once per layer during the prefill pass after computing the key and
-        value projections for all tokens in this block.
+        Used both during the initial prefill pass and when writing the first token
+        into a freshly allocated decode block (where there is no prior tensor to
+        concatenate onto).
 
         Parameters
         ----------
@@ -181,10 +198,7 @@ class Block:
 
     def read_kv_cache(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Read the stored KV tensors for a transformer layer.
-
-        Used during attention computation to retrieve pre-computed key/value
-        tensors for cache-hit blocks, avoiding redundant forward passes.
+        Return the cached key and value tensors for *layer_id*.
 
         Parameters
         ----------
@@ -194,13 +208,7 @@ class Block:
         Returns
         -------
         tuple[torch.Tensor, torch.Tensor]
-            ``(k_cache, v_cache)``, both of shape
-            ``[B, num_kv_heads, seq_len, head_dim]``.
-
-        Raises
-        ------
-        AssertionError
-            If the requested layer has not been written yet (i.e. ``is_empty`` is ``True``).
+            ``(k_cache, v_cache)`` each of shape ``[B, num_kv_heads, seq_len, head_dim]``.
         """
         assert 0 <= layer_id < self.num_transformer_layers
         k_cache = self.k_cache[layer_id]
@@ -215,37 +223,34 @@ class Block:
             new_token_ids: list[int],
             k_cache: torch.Tensor,
             v_cache: torch.Tensor,
+            update_token_ids: bool = True,
     ) -> None:
         """
-        Append new KV tensors to an existing block during the decode phase.
+        Extend the KV cache for *layer_id* with one (or more) new token(s).
 
-        During autoregressive decoding each step produces a single new token
-        whose key/value vectors are concatenated onto the tensors already stored
-        in the block.  For speculative decoding ``seq_len`` may be greater than 1.
+        Called once per transformer layer during each decode step.  Because many
+        layers process the same logical token, ``update_token_ids`` must be ``True``
+        only for the **first** layer call (``layer_id == 0``) to avoid appending the
+        same token IDs multiple times.
 
         Parameters
         ----------
         layer_id : int
             Zero-based transformer layer index.
         new_token_ids : list[int]
-            One or more token IDs produced during the decode step.
+            Token IDs for the new positions being appended.  Length must match the
+            sequence-length dimension of *k_cache* and *v_cache*.
         k_cache : torch.Tensor
-            New key tensor of shape ``[B, num_kv_heads, seq_len, head_dim]``.
-            ``seq_len`` is typically 1 for standard autoregressive decoding.
+            New key tensor of shape ``[B, num_kv_heads, len(new_token_ids), head_dim]``.
         v_cache : torch.Tensor
-            New value tensor of shape ``[B, num_kv_heads, seq_len, head_dim]``.
-
-        Raises
-        ------
-        AssertionError
-            If the block has not been populated by ``prefill_write_kv_cache`` first,
-            or if appending would exceed ``max_token_size_per_kv_cache_block``.
+            New value tensor of shape ``[B, num_kv_heads, len(new_token_ids), head_dim]``.
+        update_token_ids : bool
+            When ``True`` (default), ``new_token_ids`` are appended to
+            ``self.token_ids``.  Pass ``False`` for layers beyond the first so that
+            the token list is only updated once per decode step.
         """
         assert 0 <= layer_id < self.num_transformer_layers
         assert len(new_token_ids) > 0, "new_token_ids must not be empty"
-        assert (
-                len(self.token_ids) + len(new_token_ids) <= self.max_token_size_per_kv_cache_block
-        ), "Appending token IDs would exceed max_token_size_per_kv_cache_block"
         assert self.k_cache[layer_id] is not None, (
             f"Layer {layer_id} has not been written via prefill_write_kv_cache; "
             "decode_append_token_ids_and_kv_cache requires an existing cache to extend."
@@ -262,10 +267,12 @@ class Block:
             "Appending would exceed max_token_size_per_kv_cache_block"
         )
 
-        self.token_ids.extend(new_token_ids)
+        if update_token_ids:
+            assert (
+                    len(self.token_ids) + len(new_token_ids) <= self.max_token_size_per_kv_cache_block
+            ), "Appending token IDs would exceed max_token_size_per_kv_cache_block"
+            self.token_ids.extend(new_token_ids)
 
         # Concatenate along the sequence-length dimension (dim=2).
         self.k_cache[layer_id] = torch.cat([self.k_cache[layer_id], k_cache], dim=2)
         self.v_cache[layer_id] = torch.cat([self.v_cache[layer_id], v_cache], dim=2)
-
-        # TODO: Seal the KV cache block once full after append.

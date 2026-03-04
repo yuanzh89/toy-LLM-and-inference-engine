@@ -7,28 +7,25 @@ from engine.sequence import Sequence, SequenceStatus
 
 class SwiGLUFFNLayer(nn.Module):
     """
-    Position-wise feed-forward network using the SwiGLU activation function.
+    Feed-forward network with the SwiGLU activation (Shazeer, 2020).
 
-    SwiGLU computes:  ``output = W3( W1(x) * silu(W2(x)) )``
+    Architecture::
 
-    which has been shown to outperform standard ReLU and GELU FFN variants
-    across a range of language model benchmarks (Noam Shazeer, 2020).
+        output = w3( silu(w1(x)) * w2(x) ) + residual
 
-    A pre-norm (RMSNorm) is applied before the projection and a residual
-    connection is added after, matching the LLaMA / Mistral architecture.
+    where ``w1`` is the gate branch, ``w2`` is the value branch, and ``w3``
+    projects back to ``d_model``.  A pre-norm (RMSNorm) is applied before the
+    projections and a residual connection is added around the entire block.
 
     Parameters
     ----------
     d_model : int
-        Model (embedding) dimension.
+        Input and output feature dimension.
     d_ff : int
-        Inner feed-forward dimension (typically 4 × d_model or 8/3 × d_model).
-    dropout : float, optional
-        Dropout probability applied to the output projection.  Default: 0.1.
-
-    Shape
-    -----
-    Input / output (via ``seq.prefill_chunked_activations``): ``[B, chunk_seq_len, d_model]``
+        Hidden dimension of the gate and value projections.
+    dropout : float
+        Dropout probability applied to the output before the residual addition.
+        Defaults to ``0.1``; set to ``0.0`` to disable.
     """
 
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
@@ -45,93 +42,121 @@ class SwiGLUFFNLayer(nn.Module):
 
         self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
 
-    def forward(self, sequences: list[Sequence], query_chunk_idxes: list[int] | None = None,
-                is_prefill: bool = True) -> None:
+    @torch.inference_mode()
+    def forward(
+            self,
+            sequences: list[Sequence],
+            query_chunk_idxes: list[int] | None = None,
+            is_prefill: bool = True,
+    ) -> None:
         """
-        Run the SwiGLU FFN on a single query chunk and write the result back.
+        Dispatch to :meth:`prefill_a_chunk` or :meth:`decode_a_batch`.
 
         Parameters
         ----------
-        seq : Sequence
-            The sequence whose activations will be read and updated.
-        query_chunk_idx : int
-            Zero-based index of the query chunk to process.  The layer reads
-            ``seq.prefill_chunked_activations[query_chunk_idx]`` and writes the result
-            back to the same slot.
+        sequences : list[Sequence]
+            For prefill: a single-element list.  For decode: one entry per sequence
+            in the batch.
+        query_chunk_idxes : list[int] | None
+            Required for prefill; ignored for decode.
+        is_prefill : bool
+            ``True`` to run the prefill path, ``False`` for decode.
         """
-
         if is_prefill:
             assert len(sequences) == len(query_chunk_idxes) == 1
             assert sequences[0].status == SequenceStatus.PREFILL_PENDING
         else:
-            assert all([seq.status == SequenceStatus.DECODE_PENDING for seq in
-                        sequences]), "All input sequences should be in DECODE_PENDING status for batched decoding."
+            assert all(
+                seq.status == SequenceStatus.DECODE_PENDING for seq in sequences
+            ), "All sequences must be in DECODE_PENDING status for batched decoding."
 
         if is_prefill:
             self.prefill_a_chunk(sequences[0], query_chunk_idxes[0])
         else:
             self.decode_a_batch(sequences)
 
+    @torch.inference_mode()
     def prefill_a_chunk(self, seq: Sequence, query_chunk_idx: int) -> None:
-        x = seq.get_query_chunk_activations(query_chunk_idx)  # [B, chunk_len, d_model]
+        """
+        Run the FFN for one query chunk during prefill.
+
+        Reads from ``seq.prefill_chunked_activations[query_chunk_idx]`` and
+        writes the result back to the same slot with the residual applied.
+
+        Parameters
+        ----------
+        seq : Sequence
+            The sequence being prefilled.
+        query_chunk_idx : int
+            Zero-based index of the query chunk to process.
+        """
+        x = seq.get_query_chunk_activations(query_chunk_idx)  # [1, chunk_len, d_model]
         residual = x
 
         x = self.rms_norm(x)
 
-        x1 = self.w1(x)  # [batch_size == 1, chunk_len, d_ff]  — gate branch
-        x2 = self.w2(x)  # [batch_size == 1, chunk_len, d_ff]  — value branch
-        output = self.w3(x1 * F.silu(x2))  # [B, chunk_len, d_model]
+        gate = self.w1(x)   # [1, chunk_len, d_ff]
+        value = self.w2(x)  # [1, chunk_len, d_ff]
+        output = self.w3(F.silu(gate) * value)  # [1, chunk_len, d_model]
 
         output = self.dropout(output)
 
         seq.prefill_chunked_activations[query_chunk_idx] = output + residual
 
+    @torch.inference_mode()
     def decode_a_batch(self, sequences: list[Sequence]) -> None:
+        """
+        Run the FFN for one decode step across a batch of sequences.
+
+        Reads ``decode_activations`` from each sequence, applies the FFN, and
+        writes the result (with the residual) back per-sequence.
+
+        Parameters
+        ----------
+        sequences : list[Sequence]
+            Batch of sequences in ``DECODE_PENDING`` status.
+        """
         activations = [seq.decode_activations for seq in sequences]
-        # [batch_size, seq_len == 1, d_model]
+        # [batch_size, 1, d_model]
         x = torch.cat(activations, dim=0)
         residual = x
         x = self.rms_norm(x)
 
-        x1 = self.w1(x)
-        x2 = self.w2(x)
-        # [batch_size, seq_len == 1, d_model]
-        output = self.w3(x1 * F.silu(x2))
+        gate = self.w1(x)   # [batch_size, 1, d_ff]
+        value = self.w2(x)  # [batch_size, 1, d_ff]
+        # [batch_size, 1, d_model]
+        output = self.w3(F.silu(gate) * value)
 
         output = self.dropout(output)
-
-        output = output + residual
+        output = output + residual  # [batch_size, 1, d_model]
 
         for idx, seq in enumerate(sequences):
-            # Decode activation shape: [batch_size == 1, seq_len == 1, d_model] per sequence
-            seq.decode_activations = output[idx, :, :]
+            # Preserve the [1, 1, d_model] shape expected by subsequent layers.
+            seq.decode_activations = output[idx:idx + 1, :, :]
 
 
 class FusedSwiGLUFFNLayer(nn.Module):
     """
-    Fused SwiGLU feed-forward layer that combines the two gate/value projections
-    into a single matrix multiply for improved hardware efficiency.
+    Feed-forward network with SwiGLU activation using a fused gate+value projection.
 
-    The fused weight ``w12`` has shape ``[d_model, 2 * d_ff]`` and is split in
-    half along the output dimension to yield the gate (``x1``) and value (``x2``)
-    streams.
+    Identical in behaviour to :class:`SwiGLUFFNLayer` but uses a single fused
+    matrix multiply for the gate and value branches, splitting the output in two.
+    This can improve throughput by reducing the number of GEMM kernel launches.
 
-    Unlike :class:`SwiGLUFFNLayer`, this variant operates on a bare
-    ``torch.Tensor`` rather than a :class:`Sequence` object, making it suitable
-    for use in non-chunked or standalone contexts.
+    Architecture::
+
+        x12 = w12(x)                        # [B, T, 2 * d_ff]
+        gate, value = split(x12, d_ff)
+        output = w3( silu(gate) * value ) + residual
 
     Parameters
     ----------
     d_model : int
-        Model (embedding) dimension.
+        Input and output feature dimension.
     d_ff : int
-        Inner feed-forward dimension.
-    dropout : float, optional
-        Dropout probability.  Default: 0.1.
-
-    Shape
-    -----
-    Input / output: ``[B, seq_len, d_model]``
+        Hidden dimension of each of the two halves of the fused projection.
+    dropout : float
+        Dropout probability applied to the output before the residual addition.
     """
 
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
@@ -152,22 +177,22 @@ class FusedSwiGLUFFNLayer(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Shape ``[B, seq_len, d_model]``.
+            Input tensor of shape ``[B, T, d_model]``.
 
         Returns
         -------
         torch.Tensor
-            Shape ``[B, seq_len, d_model]``.
+            Output tensor of shape ``[B, T, d_model]``.
         """
         residual = x
 
         x = self.rms_norm(x)
 
-        x12 = self.w12(x)  # [B, seq_len, 2 * d_ff]
-        x1, x2 = x12.split(self.d_ff, dim=-1)  # each [B, seq_len, d_ff]
+        x12 = self.w12(x)               # [B, T, 2 * d_ff]
+        gate, value = x12.split(self.d_ff, dim=-1)  # each [B, T, d_ff]
 
-        out = x1 * F.silu(x2)  # SwiGLU activation
-        out = self.w3(out)  # [B, seq_len, d_model]
+        out = F.silu(gate) * value      # SwiGLU activation
+        out = self.w3(out)              # [B, T, d_model]
         out = self.dropout(out)
 
         return out + residual

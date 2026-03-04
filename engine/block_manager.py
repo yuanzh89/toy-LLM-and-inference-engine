@@ -21,6 +21,16 @@ class BlockManager:
        the portions of a sequence that are not already cached.
     3. **Eviction** – when the pool is full, free blocks whose ``ref_count`` is zero
        (i.e. not pinned by any active sequence), preferring deep-trie blocks first.
+    4. **Sealing** – after a decode step, insert newly filled blocks into the trie so
+       future sequences can reuse them as cached prefixes.
+
+    Trie insertion policy
+    ---------------------
+    Only *full* blocks (token count == ``max_token_size_per_kv_cache_block``) are
+    inserted into the trie.  The partial last block of a sequence and all freshly
+    allocated decode blocks start with ``trie_tree_depth == 0`` and are sealed via
+    :meth:`seal_full_decode_blocks` once they are full and all KV layers have been
+    written.
 
     Example usage flow
     ------------------
@@ -33,7 +43,7 @@ class BlockManager:
 
     Suppose the sequence needs 4 blocks and the trie yields 2 prefix hits (b1, b2).
     ``allocate_blocks`` will attempt to evict old blocks to make room and then
-    allocate b3 and b4.
+    allocate b3 and b4.  If b4 is a partial block it is kept out of the trie.
 
     **Step 3** – In each attention layer, read cached blocks::
 
@@ -51,9 +61,10 @@ class BlockManager:
         K = concat([k1, k2, k3, k4], dim=2)  # dim=2 is the seq_len axis
         V = concat([v1, v2, v3, v4], dim=2)
 
-    **Step 4** – During decode, each new token's KV slice is appended::
+    **Step 4** – During decode, each new token's KV slice is appended via
+    ``seq.append_kv_cache``.  After the full decode forward pass::
 
-        b4.decode_append_token_ids_and_kv_cache(layer_id, [new_token_id], k_new, v_new)
+        block_manager.seal_full_decode_blocks(seq)
 
     Attributes
     ----------
@@ -112,13 +123,14 @@ class BlockManager:
         The method proceeds in the following steps:
 
         1. Chunk the sequence token IDs and walk the prefix trie to find how many
-           blocks are already cached.
+           full blocks are already cached.
         2. Compute the number of new blocks required.
         3. Call ``evict_blocks`` to free space if the pool is full.  If eviction
            cannot satisfy the requirement, roll back any incremented reference counts
            and return ``False``.
         4. Allocate new :class:`~kv_cache_block.Block` objects for the uncached suffix
-           and insert them into the trie.
+           and insert full blocks into the trie.  The partial last block (if any) is
+           kept out of the trie so it remains appendable during decode.
         5. Hand the complete ordered block list to the sequence via
            ``seq.update_kv_cache_blocks``.
 
@@ -138,6 +150,7 @@ class BlockManager:
         seq.reset_kv_cache_blocks(num_chunks)
 
         # --- Step 1: Walk the trie to find cached prefix blocks ---
+        # Only full blocks are in the trie, so partial last chunks never match.
         blocks: list[Block] = []
         trie_node = self.block_trie_tree.root
         for token_ids_chunk in token_ids_chunks:
@@ -161,16 +174,78 @@ class BlockManager:
         chunk_index = len(blocks)
         while chunk_index < len(token_ids_chunks):
             token_id_chunk = token_ids_chunks[chunk_index]
-            block = self.allocate_block(token_id_chunk, trie_node)
+            is_last_chunk = chunk_index == len(token_ids_chunks) - 1
+            is_partial = len(token_id_chunk) < self.max_token_size_per_kv_cache_block
+
+            # Only insert full blocks into the trie.  Partial last blocks are kept
+            # out (trie_tree_depth stays 0) so they remain appendable during decode.
+            trie_parent = trie_node if not (is_last_chunk and is_partial) else None
+            block = self.allocate_block(token_id_chunk, trie_parent)
             block.inc_ref_count()
             blocks.append(block)
-            # Advance trie_node to the freshly created child for the next iteration.
-            trie_node = trie_node.children[tuple(token_id_chunk)]
+
+            # Advance trie_node only when we actually inserted into the trie.
+            if trie_parent is not None:
+                trie_node = trie_node.children[tuple(token_id_chunk)]
+
             chunk_index += 1
 
         # --- Step 5: Attach the complete block list to the sequence ---
         seq.update_kv_cache_blocks(blocks)
         return True
+
+    # ------------------------------------------------------------------
+    # Sealing
+    # ------------------------------------------------------------------
+
+    def seal_full_decode_blocks(self, seq: Sequence) -> None:
+        """
+        Insert any newly filled decode blocks into the prefix-caching trie.
+
+        Should be called after the complete decode forward pass for a sequence —
+        i.e. after every transformer layer has written its KV tensors.  A block is
+        eligible for sealing when:
+
+        * it is full (``block.is_full()``),
+        * it is not yet in the trie (``block.trie_tree_depth == 0``), and
+        * all transformer layers have been written (no ``None`` entries in
+          ``block.k_cache``).
+
+        Sealing a block makes it available as a cached prefix for future sequences.
+        If a block's predecessor in the sequence is not yet in the trie (e.g. it too
+        is unsealed), sealing is deferred until the next opportunity.
+
+        Parameters
+        ----------
+        seq : Sequence
+            The sequence whose blocks should be inspected for sealing.
+        """
+        for i, block in enumerate(seq.kv_cache_blocks):
+            if not block.is_full() or block.trie_tree_depth != 0:
+                continue
+            # Ensure all KV layers have been written before sealing.
+            if any(k is None for k in block.k_cache):
+                continue
+
+            # Determine the parent trie node.
+            if i == 0:
+                parent_trie_node = self.block_trie_tree.root
+            else:
+                prev_block = seq.kv_cache_blocks[i - 1]
+                if prev_block.trie_node is None:
+                    # Predecessor not yet sealed; cannot seal this block yet.
+                    continue
+                parent_trie_node = prev_block.trie_node
+
+            # Insert into the trie and update bookkeeping fields.
+            trie_node = parent_trie_node.add_child(block.token_ids, block)
+            block.trie_node = trie_node
+
+            if parent_trie_node.block is None:
+                # Parent is the virtual root; this block sits at depth 1.
+                block.trie_tree_depth = 1
+            else:
+                block.trie_tree_depth = parent_trie_node.block.trie_tree_depth + 1
 
     # ------------------------------------------------------------------
     # Eviction
@@ -200,19 +275,18 @@ class BlockManager:
             ``True`` if the pool now has at least *needed_kv_cache_blocks* free slots;
             ``False`` if there are not enough zero-ref-count blocks to evict.
         """
-        if needed_kv_cache_blocks <= 0:
+        if needed_kv_cache_blocks <= self.available_blocks():
             return True
 
         # Sort so the best eviction candidate (ref_count == 0, deepest trie depth)
         # ends up at the tail; pop from the tail for O(1) removal.
         self.blocks.sort(reverse=True)
 
-        while needed_kv_cache_blocks > 0 and self.blocks and self.blocks[-1].ref_count == 0:
+        while needed_kv_cache_blocks > self.available_blocks() and self.blocks and self.blocks[-1].ref_count == 0:
             block_to_evict = self.blocks.pop()
             self._remove_block_from_trie(block_to_evict)
-            needed_kv_cache_blocks -= 1
 
-        return needed_kv_cache_blocks == 0
+        return needed_kv_cache_blocks <= self.available_blocks()
 
     def _remove_block_from_trie(self, block: Block) -> None:
         """
@@ -245,14 +319,16 @@ class BlockManager:
             self, token_ids: list[int], parent_trie_node: BlockTrieNode | None
     ) -> Block:
         """
-        Create a new, empty KV-cache block and register it in the trie.
+        Create a new, empty KV-cache block and optionally register it in the trie.
 
         This method assumes that ``evict_blocks`` has already ensured there is
         sufficient space in the pool.  It does **not** check pool capacity itself.
 
-        The new block's ``trie_tree_depth`` is set to one greater than its parent's
-        depth (or 1 if the parent is the virtual root), so that eviction ordering
-        is correct.
+        When *parent_trie_node* is provided (non-``None``), the new block is inserted
+        as a child of that node and ``trie_tree_depth`` is set accordingly.  When
+        *parent_trie_node* is ``None`` the block is created in decode-only mode
+        (``trie_tree_depth == 0``, ``can_append() == True``) and will be sealed later
+        by :meth:`seal_full_decode_blocks` once it is full.
 
         Parameters
         ----------
@@ -261,7 +337,7 @@ class BlockManager:
             final chunk.
         parent_trie_node : BlockTrieNode | None
             The trie node under which the new block should be registered.  Pass
-            ``None`` to skip trie insertion (e.g. for temporary decode-only blocks).
+            ``None`` to skip trie insertion (partial last blocks, new decode blocks).
 
         Returns
         -------
@@ -269,7 +345,8 @@ class BlockManager:
             The newly created, empty KV-cache block.
         """
         block_id = next(BlockManager.counter)
-        block = Block(block_id, token_ids, self.num_transformer_layers)
+        block = Block(block_id, token_ids, self.num_transformer_layers,
+                      self.max_token_size_per_kv_cache_block)
         self.blocks.append(block)
 
         if parent_trie_node is not None:

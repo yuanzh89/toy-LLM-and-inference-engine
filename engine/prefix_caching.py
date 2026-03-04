@@ -13,9 +13,9 @@ class BlockTrieNode:
     A single node in the :class:`BlockTrieTree`.
 
     Each node represents one KV-cache block's worth of token IDs and holds a
-    reference to the corresponding :class:`Block`.  The ``children`` dict maps a
-    ``tuple[int, ...]`` of token IDs to the next :class:`BlockTrieNode` in the
-    trie, enabling O(depth) prefix lookups.
+    reference to the corresponding :class:`~kv_cache_block.Block`.  The ``children``
+    dict maps a ``tuple[int, ...]`` of token IDs to the next :class:`BlockTrieNode`
+    in the trie, enabling O(depth) prefix lookups.
 
     Attributes
     ----------
@@ -47,7 +47,13 @@ class BlockTrieNode:
 
     @property
     def ref_count(self) -> int:
-        """Convenience proxy for the underlying block's reference count."""
+        """
+        Convenience proxy for the underlying block's reference count.
+
+        Returns ``0`` for the virtual root node, which has no associated block.
+        """
+        if self.block is None:
+            return 0
         return self.block.ref_count
 
     def key(self) -> tuple[int, ...]:
@@ -110,9 +116,14 @@ class BlockTrieTree:
     A trie (prefix tree) over KV-cache blocks used for prefix-cache matching.
 
     Each path from the root to a leaf node represents a sequence of token-ID
-    chunks whose KV tensors are already cached.  When a new sequence arrives,
-    the trie is walked to find the longest matching cached prefix, avoiding
-    redundant computation.
+    chunks whose KV tensors are already cached.  Only *full* blocks (whose token
+    count equals ``max_token_size_per_kv_cache_block``) are inserted into the trie;
+    partial last blocks and unsealed decode blocks are kept out of the trie until
+    :meth:`~block_manager.BlockManager.seal_full_decode_blocks` is called after the
+    decode step that fills them.
+
+    When a new sequence arrives, the trie is walked to find the longest matching
+    cached prefix, avoiding redundant computation.
 
     Attributes
     ----------
@@ -134,6 +145,9 @@ class BlockTrieTree:
         may be a full match (all chunks cached), a partial match, or an empty list
         (no cached prefix at all).
 
+        Note: only full blocks exist in the trie, so a partial last chunk will
+        never produce a cache hit.
+
         Parameters
         ----------
         seq : Sequence
@@ -142,9 +156,9 @@ class BlockTrieTree:
         Returns
         -------
         list[Block]
-            Ordered list of :class:`Block` objects corresponding to the matched
-            prefix chunks.  Length is between 0 and
-            ``len(seq.token_ids_in_chunks())``.
+            Ordered list of :class:`~kv_cache_block.Block` objects corresponding to
+            the matched prefix chunks.  Length is between 0 and the number of full
+            blocks in ``seq.token_ids_in_chunks()``.
         """
         blocks: list[Block] = []
         node = self.root

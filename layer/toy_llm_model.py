@@ -24,17 +24,17 @@ class ToyLLMModel(nn.Module):
     Weight tying
     ------------
     The embedding matrix and the LM-head projection matrix share the same
-    underlying parameters, halving the parameter count at the vocabulary
-    boundary and stabilising training (Press & Wolf, 2017).
+    underlying parameters, halving the parameter count at the vocabulary boundary
+    and stabilising training (Press & Wolf, 2017).
 
     Parameters
     ----------
     llm_config : ToyLLMConfig
         Unified model/inference configuration.  All architecture hyper-parameters
-        are read from this object; no individual overrides are needed.
+        are read from this object.
     block_manager : BlockManager
-        Manages paged physical KV-cache blocks.  Passed to every transformer
-        layer so they can read/write the cache without going through the model.
+        Manages paged physical KV-cache blocks.  Passed to every transformer layer
+        so they can read/write the cache without going through the model.
 
     Attributes
     ----------
@@ -74,102 +74,126 @@ class ToyLLMModel(nn.Module):
         # Weight tying: share parameters between the embedding table and the LM head.
         self.lm_head.weight = self.embedding.weight
 
-    def forward(self, sequences: list[Sequence], query_chunk_idxes: list[int] | None = None,
-                is_prefill: bool = True) -> None:
+    @torch.inference_mode()
+    def forward(
+            self,
+            sequences: list[Sequence],
+            query_chunk_idxes: list[int] | None = None,
+            is_prefill: bool = True,
+    ) -> None:
         """
-        Run a single forward pass for one query chunk and return the next token ID.
+        Run a single forward pass — one query chunk (prefill) or one decode step.
 
-        During **prefill** this is called once per query chunk (the model reads the
-        prompt).  During **decode** it is called once per generated step with a
-        single-token chunk.
+        During **prefill** this is called once per query chunk.  During **decode**
+        it is called once per generated step for the whole batch.
 
         Parameters
         ----------
-        seq : Sequence
-            The sequence being processed.  Token IDs, KV-cache blocks, and chunked
-            activations are all stored on the sequence object.
-        query_chunk_idx : int
-            Zero-based index of the query chunk to process.
-
-        Returns
-        -------
-        int
-            The token ID with the highest probability for the *next* position
-            (i.e. greedy decoding of the last token in the chunk).
+        sequences : list[Sequence]
+            For prefill: a single-element list.  For decode: one entry per sequence
+            in the batch.
+        query_chunk_idxes : list[int] | None
+            Required for prefill (zero-based chunk indices); ignored for decode.
+        is_prefill : bool
+            ``True`` to run the prefill path, ``False`` for decode.
         """
         if is_prefill:
             assert len(sequences) == len(query_chunk_idxes) == 1
             assert sequences[0].status == SequenceStatus.PREFILL_PENDING
         else:
-            assert all([seq.status == SequenceStatus.DECODE_PENDING for seq in
-                        sequences]), "All input sequences should be in DECODE_PENDING status for batched decoding."
+            assert all(
+                seq.status == SequenceStatus.DECODE_PENDING for seq in sequences
+            ), "All sequences must be in DECODE_PENDING status for batched decoding."
 
         if is_prefill:
             self.prefill_a_chunk(sequences[0], query_chunk_idxes[0])
         else:
             self.decode_a_batch(sequences)
 
+    @torch.inference_mode()
     def prefill_a_chunk(self, seq: Sequence, query_chunk_idx: int) -> None:
+        """
+        Embed and process one query chunk, then greedily sample the next token.
+
+        The sampled token is appended to ``seq.token_ids`` so that subsequent
+        chunks and the eventual decode phase see the full history.
+
+        Parameters
+        ----------
+        seq : Sequence
+            The sequence being prefilled.
+        query_chunk_idx : int
+            Zero-based index of the query chunk to process.
+        """
         token_ids_in_chunks = seq.token_ids_in_chunks()
         assert 0 <= query_chunk_idx < len(token_ids_in_chunks)
 
         # Embed the token IDs for this chunk.
-        # token_ids_chunk: [batch_size == 1, chunk_seq_len]
+        # Shape: [1, chunk_seq_len]
         token_ids_chunk = torch.tensor(
             token_ids_in_chunks[query_chunk_idx]
         ).unsqueeze(0)
 
         # Initialise chunk activations from the embedding table.
-        # Shape: [B, chunk_seq_len, d_model]
+        # Shape: [1, chunk_seq_len, d_model]
         seq.prefill_chunked_activations[query_chunk_idx] = self.embedding(token_ids_chunk)
 
         # Run each transformer block on this chunk.
         for transformer_layer in self.transformer_layers:
-            transformer_layer(seq, query_chunk_idx)
+            transformer_layer([seq], [query_chunk_idx], is_prefill=True)
 
-        # Read the updated activations for this chunk, apply final norm, and project.
-        x = seq.prefill_chunked_activations[query_chunk_idx]  # [B, chunk_seq_len, d_model]
+        # Apply final norm and project to vocabulary logits.
+        x = seq.prefill_chunked_activations[query_chunk_idx]  # [1, chunk_seq_len, d_model]
         x = self.rms_norm(x)
 
-        # Project to vocabulary logits and compute probabilities.
-        # [B, chunk_seq_len, vocab_size]
-        logits = self.lm_head(x)
+        logits = self.lm_head(x)               # [1, chunk_seq_len, vocab_size]
         probs = F.softmax(logits, dim=-1)
 
-        # Greedy decode: take the argmax at the last token position only.
-        # [B, vocab_size] → [B]
-        next_token_id = torch.argmax(probs[:, -1, :], dim=-1)
-
-        # Append the newly generated token so subsequent steps see it.
+        # Greedy decode: argmax at the last token position.
+        next_token_id = torch.argmax(probs[:, -1, :], dim=-1)  # [1]
         seq.append_token(next_token_id.item())
 
+    @torch.inference_mode()
     def decode_a_batch(self, sequences: list[Sequence]) -> None:
-        # [batch_size, seq_len == 1]
-        token_ids = torch.tensor([seq.get_last_token_id() for seq in sequences]).unsqueeze(1)
+        """
+        Embed the last token for each sequence and run one decode step.
 
-        # [batch_size, seq_len == 1, d_model]
+        The next-token prediction is sampled greedily and appended to each
+        sequence's ``token_ids``.
+
+        Parameters
+        ----------
+        sequences : list[Sequence]
+            Batch of sequences in ``DECODE_PENDING`` status.
+        """
+        # Embed the most recently generated token for each sequence.
+        # [batch_size, 1]
+        token_ids = torch.tensor(
+            [seq.get_last_token_id() for seq in sequences]
+        ).unsqueeze(1)
+
+        # [batch_size, 1, d_model]
         x = self.embedding(token_ids)
 
+        # Distribute embeddings as the initial decode activation for each sequence.
+        # Shape per sequence: [1, 1, d_model].
         for idx, seq in enumerate(sequences):
-            # Initialize activations for decode
-            seq.decode_activations = x[idx, :, :]
+            seq.decode_activations = x[idx:idx + 1, :, :]
 
+        # Run all transformer blocks in decode mode.
         for transformer_layer in self.transformer_layers:
-            transformer_layer(sequences)
+            transformer_layer(sequences, is_prefill=False)
 
-        # [batch_size, seq_len == 1, d_model]
+        # Gather updated activations and apply final norm.
+        # [batch_size, 1, d_model]
         x = torch.cat([seq.decode_activations for seq in sequences], dim=0)
         x = self.rms_norm(x)
 
-        # Project to vocabulary logits and compute probabilities.
-        # [B, chunk_seq_len, vocab_size]
-        logits = self.lm_head(x)
+        logits = self.lm_head(x)               # [batch_size, 1, vocab_size]
         probs = F.softmax(logits, dim=-1)
 
-        # Greedy decode: take the argmax at the last token position only.
-        # [B, vocab_size] → [B]
-        next_token_id = torch.argmax(probs[:, -1, :], dim=-1)
+        # Greedy decode: argmax at the single output position.
+        next_token_ids = torch.argmax(probs[:, -1, :], dim=-1)  # [batch_size]
 
-        # Append the newly generated token so subsequent steps see it.
         for idx, seq in enumerate(sequences):
-            seq.append_token(next_token_id[idx].item())
+            seq.append_token(next_token_ids[idx].item())
