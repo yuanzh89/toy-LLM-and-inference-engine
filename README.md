@@ -41,7 +41,7 @@ The engine implements a decoder-only transformer with a full suite of inference 
 Each of the `N` transformer blocks follows the Pre-Norm pattern:
 
 ```
-x  ──► RMSNorm ──► GQA (with KV cache) ──► + ──► RMSNorm ──► SwiGLU FFN ──► +
+x  ──► RMSNorm ──► GQA (with KV cache) ──► + ──► RMSNorm ──► SwiGLU FFN ──► + ──►
 │                                           ▲                                  ▲
 └───────────────────────────────────────────┘  ────────────────────────────────┘
               residual                                     residual
@@ -78,7 +78,7 @@ Eviction prefers the deepest nodes first, keeping the most-reused shallow prefix
                   ┌─────────────────────────────────────────┐
                   │             Prefill Node                │
                   │                                         │
-   prefill_queue ─►  PrefillChunker  ──►  PrefillForward   ├──► decode_schedule_queue
+   prefill_queue ─►  PrefillChunker  ──►  PrefillForward    ├──► decode_schedule_queue
                   │      Thread              Thread         │
                   └─────────────────────────────────────────┘
                                                                        │
