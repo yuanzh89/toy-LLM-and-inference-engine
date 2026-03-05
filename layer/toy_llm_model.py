@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from config import ToyLLMConfig
 from engine.block_manager import BlockManager
 from engine.sequence import Sequence, SequenceStatus
-from transformer_block_with_kv_cache import TransformerBlock
+from transformer_block import TransformerBlock
 
 
 class ToyLLMModel(nn.Module):
